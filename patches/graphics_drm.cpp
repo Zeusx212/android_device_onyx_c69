@@ -84,6 +84,7 @@ static uint32_t prop_plane_src_x = 0;
 static uint32_t prop_plane_src_y = 0;
 static uint32_t prop_plane_src_w = 0;
 static uint32_t prop_plane_src_h = 0;
+static uint32_t prop_plane_zpos = 0;
 static uint32_t prop_epdc_parms_addr = 0;
 static uint32_t prop_epdc_cnt = 0;
 
@@ -467,6 +468,8 @@ static void init_atomic_properties(int fd, drmModeCrtc *crtc, drmModeConnector *
                     prop_plane_src_w = pr->prop_id;
                 else if (!strcmp(pr->name, "SRC_H"))
                     prop_plane_src_h = pr->prop_id;
+                else if (!strcmp(pr->name, "zpos"))
+                    prop_plane_zpos = pr->prop_id;
                 else if (!strcmp(pr->name, "EPDC_UPDATE_PARMS_ADDR"))
                     prop_epdc_parms_addr = pr->prop_id;
                 else if (!strcmp(pr->name, "EPDC_UPDATE_CNT"))
@@ -599,24 +602,16 @@ static GRSurface* drm_init(minui_backend* backend __unused) {
 
     /*
      * For Onyx Boox C69HD (Qualcomm SM6225 Bengal):
-     * The physical E-Ink panel resolution is 1024x758.
-     * The DSI interface between DPU and EPDC FPGA runs at 301x769 timing mode,
-     * but the kernel __sde_plane_atomic_update_epdc driver requires the plane
-     * dimensions and framebuffer to be exactly 1024x758.
+     * The physical EPDC timing over DSI is hactive x vactive (301x769 @ 90Hz).
+     * The Qualcomm SDE kernel driver validates crtc_w <= mode.hdisplay and
+     * rejects any atomic commit exceeding hdisplay with -E2BIG (-7).
+     * Matching stock librecovery_ui.so, we set screen_width and screen_height
+     * directly from the CRTC display timing mode.
      */
-    if ((main_monitor_crtc->mode.hdisplay == 301 && main_monitor_crtc->mode.vdisplay == 769) ||
-        main_monitor_connector->connector_id == 46) {
-        screen_width = 1024;
-        screen_height = 758;
-        printf("minui: Onyx Boox EPDC detected: DSI timing %dx%d @ %d Hz, E-Ink canvas: %dx%d\n",
-               main_monitor_crtc->mode.hdisplay, main_monitor_crtc->mode.vdisplay,
-               main_monitor_crtc->mode.vrefresh, screen_width, screen_height);
-    } else {
-        screen_width = main_monitor_crtc->mode.hdisplay;
-        screen_height = main_monitor_crtc->mode.vdisplay;
-        printf("minui: Screen resolution detected: %dx%d @ %d Hz\n",
-               screen_width, screen_height, main_monitor_crtc->mode.vrefresh);
-    }
+    screen_width = main_monitor_crtc->mode.hdisplay;
+    screen_height = main_monitor_crtc->mode.vdisplay;
+    printf("minui: Physical display resolution: %dx%d @ %d Hz\n",
+           screen_width, screen_height, main_monitor_crtc->mode.vrefresh);
 
     drmModeFreeResources(res);
 
@@ -667,8 +662,13 @@ static GRSurface* drm_init(minui_backend* backend __unused) {
 
             drmModeAtomicAddProperty(req, g_plane_id, prop_plane_fb_id, drm_surfaces[1]->fb_id);
             drmModeAtomicAddProperty(req, g_plane_id, prop_plane_crtc_id, main_monitor_crtc->crtc_id);
+            if (prop_plane_zpos) drmModeAtomicAddProperty(req, g_plane_id, prop_plane_zpos, 0);
+            if (prop_plane_src_x) drmModeAtomicAddProperty(req, g_plane_id, prop_plane_src_x, 0);
+            if (prop_plane_src_y) drmModeAtomicAddProperty(req, g_plane_id, prop_plane_src_y, 0);
             if (prop_plane_src_w) drmModeAtomicAddProperty(req, g_plane_id, prop_plane_src_w, ((uint64_t)screen_width) << 16);
             if (prop_plane_src_h) drmModeAtomicAddProperty(req, g_plane_id, prop_plane_src_h, ((uint64_t)screen_height) << 16);
+            if (prop_plane_crtc_x) drmModeAtomicAddProperty(req, g_plane_id, prop_plane_crtc_x, 0);
+            if (prop_plane_crtc_y) drmModeAtomicAddProperty(req, g_plane_id, prop_plane_crtc_y, 0);
             if (prop_plane_crtc_w) drmModeAtomicAddProperty(req, g_plane_id, prop_plane_crtc_w, screen_width);
             if (prop_plane_crtc_h) drmModeAtomicAddProperty(req, g_plane_id, prop_plane_crtc_h, screen_height);
 
@@ -681,6 +681,7 @@ static GRSurface* drm_init(minui_backend* backend __unused) {
                 g_epdc_parms[0].waveform_mode = 2; // GC16 full refresh on boot
                 g_epdc_parms[0].update_mode = 0;
                 g_epdc_parms[0].update_marker = ++g_update_marker;
+                g_epdc_parms[0].temp = 24; // 24 C ambient temperature index
                 g_epdc_parms[0].flag = 0;
 
                 drmModeAtomicAddProperty(req, g_plane_id, prop_epdc_parms_addr, (uint64_t)(uintptr_t)&g_epdc_parms[0]);
@@ -715,8 +716,13 @@ static GRSurface* drm_flip(minui_backend* backend __unused) {
         if (req) {
             drmModeAtomicAddProperty(req, g_plane_id, prop_plane_fb_id, drm_surfaces[current_buffer]->fb_id);
             drmModeAtomicAddProperty(req, g_plane_id, prop_plane_crtc_id, main_monitor_crtc->crtc_id);
+            if (prop_plane_zpos) drmModeAtomicAddProperty(req, g_plane_id, prop_plane_zpos, 0);
+            if (prop_plane_src_x) drmModeAtomicAddProperty(req, g_plane_id, prop_plane_src_x, 0);
+            if (prop_plane_src_y) drmModeAtomicAddProperty(req, g_plane_id, prop_plane_src_y, 0);
             if (prop_plane_src_w) drmModeAtomicAddProperty(req, g_plane_id, prop_plane_src_w, ((uint64_t)screen_width) << 16);
             if (prop_plane_src_h) drmModeAtomicAddProperty(req, g_plane_id, prop_plane_src_h, ((uint64_t)screen_height) << 16);
+            if (prop_plane_crtc_x) drmModeAtomicAddProperty(req, g_plane_id, prop_plane_crtc_x, 0);
+            if (prop_plane_crtc_y) drmModeAtomicAddProperty(req, g_plane_id, prop_plane_crtc_y, 0);
             if (prop_plane_crtc_w) drmModeAtomicAddProperty(req, g_plane_id, prop_plane_crtc_w, screen_width);
             if (prop_plane_crtc_h) drmModeAtomicAddProperty(req, g_plane_id, prop_plane_crtc_h, screen_height);
 
@@ -730,6 +736,7 @@ static GRSurface* drm_flip(minui_backend* backend __unused) {
                 g_epdc_parms[0].waveform_mode = 255; // Auto waveform for fast page flip
                 g_epdc_parms[0].update_mode = 0;
                 g_epdc_parms[0].update_marker = ++g_update_marker;
+                g_epdc_parms[0].temp = 24; // 24 C ambient temperature index
                 g_epdc_parms[0].flag = 0;
 
                 drmModeAtomicAddProperty(req, g_plane_id, prop_epdc_parms_addr, (uint64_t)(uintptr_t)&g_epdc_parms[0]);
