@@ -405,77 +405,89 @@ static drmModeConnector *find_main_monitor(int fd, drmModeRes *resources, uint32
 }
 
 /*
- * Disable non-main CRTCs (e.g. CRTC 112) and secondary connectors (Connector 46 / DSI-2).
- * On Onyx Boox C69HD, the bootloader initializes continuous splash on CRTC 112 / Connector 46.
- * When TWRP activates CRTC 75 / Connector 29 (the EPDC command-mode interface), the Qualcomm
- * kernel unmaps the continuous splash region (0x5c000000). If CRTC 112 remains active, the
- * MDP hardware DMA engine triggers an unmapped page SMMU fault every vertical refresh,
- * jamming the MDP scanout and preventing EPDC hardware scanout from completing.
- * Setting ACTIVE=0 on CRTC 112 with DRM_MODE_ATOMIC_ALLOW_MODESET cleanly stops the continuous
- * splash hardware pipe and eliminates the SMMU fault.
+ * Populate teardown properties for non-main pipeline components directly into the modeset atomic request.
+ * On Onyx Boox C69HD, the bootloader leaves continuous splash active on CRTC 112, Connector 46,
+ * and Plane 65 (SSPP DMA0) fetching splash image data from 0x5c000000.
+ * In DRM Atomic KMS, continuous splash must be torn down simultaneously within the very same
+ * atomic commit that activates CRTC 75, Connector 29, and Plane 49.
+ * This atomically halts the Plane 65 DMA fetcher, deactivates CRTC 112, unbinds Connector 46,
+ * and eliminates the Qualcomm MDP SMMU page fault on 0x5c000000.
  */
-static void disable_non_main_crtcs(int fd, drmModeRes *resources, drmModeCrtc *main_crtc) {
-    drmModeAtomicReq *req = drmModeAtomicAlloc();
-    if (!req) return;
-
-    int crtcs_to_disable = 0;
-
-    /* 1. Set ACTIVE = 0 on all non-main CRTCs (e.g. CRTC 112) */
-    for (int i = 0; i < resources->count_crtcs; i++) {
-        uint32_t crtc_id = resources->crtcs[i];
-        if (crtc_id != main_crtc->crtc_id) {
-            drmModeObjectProperties *props = drmModeObjectGetProperties(fd, crtc_id, DRM_MODE_OBJECT_CRTC);
-            if (props) {
-                for (uint32_t j = 0; j < props->count_props; j++) {
-                    drmModePropertyRes *pr = drmModeGetProperty(fd, props->props[j]);
-                    if (!pr) continue;
-                    if (!strcmp(pr->name, "ACTIVE")) {
-                        int add_ret = drmModeAtomicAddProperty(req, crtc_id, pr->prop_id, 0);
-                        printf("minui: set ACTIVE=0 on non-main CRTC %u (prop_id=%u, ret=%d)\n",
-                               crtc_id, pr->prop_id, add_ret);
-                        crtcs_to_disable++;
+static void populate_non_main_teardown(int fd, drmModeAtomicReq *req, drmModeCrtc *main_crtc,
+                                       drmModeConnector *main_conn, uint32_t main_plane_id) {
+    /* 1. Deactivate all non-main CRTCs (CRTC 112) */
+    drmModeRes *resources = drmModeGetResources(fd);
+    if (resources) {
+        for (int i = 0; i < resources->count_crtcs; i++) {
+            uint32_t crtc_id = resources->crtcs[i];
+            if (crtc_id != main_crtc->crtc_id) {
+                drmModeObjectProperties *props = drmModeObjectGetProperties(fd, crtc_id, DRM_MODE_OBJECT_CRTC);
+                if (props) {
+                    for (uint32_t j = 0; j < props->count_props; j++) {
+                        drmModePropertyRes *pr = drmModeGetProperty(fd, props->props[j]);
+                        if (!pr) continue;
+                        if (!strcmp(pr->name, "ACTIVE")) {
+                            drmModeAtomicAddProperty(req, crtc_id, pr->prop_id, 0);
+                            printf("minui: [atomic teardown] set ACTIVE=0 on CRTC %u\n", crtc_id);
+                        } else if (!strcmp(pr->name, "MODE_ID")) {
+                            drmModeAtomicAddProperty(req, crtc_id, pr->prop_id, 0);
+                            printf("minui: [atomic teardown] set MODE_ID=0 on CRTC %u\n", crtc_id);
+                        }
+                        drmModeFreeProperty(pr);
                     }
-                    drmModeFreeProperty(pr);
+                    drmModeFreeObjectProperties(props);
                 }
-                drmModeFreeObjectProperties(props);
             }
         }
-    }
 
-    /* 2. Disconnect any non-main connectors (e.g. Connector 46 / DSI-2) */
-    for (int i = 0; i < resources->count_connectors; i++) {
-        uint32_t conn_id = resources->connectors[i];
-        if (main_monitor_connector && conn_id != main_monitor_connector->connector_id) {
-            drmModeObjectProperties *props = drmModeObjectGetProperties(fd, conn_id, DRM_MODE_OBJECT_CONNECTOR);
-            if (props) {
-                for (uint32_t j = 0; j < props->count_props; j++) {
-                    drmModePropertyRes *pr = drmModeGetProperty(fd, props->props[j]);
-                    if (!pr) continue;
-                    if (!strcmp(pr->name, "CRTC_ID")) {
-                        int add_ret = drmModeAtomicAddProperty(req, conn_id, pr->prop_id, 0);
-                        printf("minui: set CRTC_ID=0 on non-main connector %u (prop_id=%u, ret=%d)\n",
-                               conn_id, pr->prop_id, add_ret);
+        /* 2. Disconnect all non-main connectors (Connector 46 / DSI-2) */
+        for (int i = 0; i < resources->count_connectors; i++) {
+            uint32_t conn_id = resources->connectors[i];
+            if (main_conn && conn_id != main_conn->connector_id) {
+                drmModeObjectProperties *props = drmModeObjectGetProperties(fd, conn_id, DRM_MODE_OBJECT_CONNECTOR);
+                if (props) {
+                    for (uint32_t j = 0; j < props->count_props; j++) {
+                        drmModePropertyRes *pr = drmModeGetProperty(fd, props->props[j]);
+                        if (!pr) continue;
+                        if (!strcmp(pr->name, "CRTC_ID")) {
+                            drmModeAtomicAddProperty(req, conn_id, pr->prop_id, 0);
+                            printf("minui: [atomic teardown] set CRTC_ID=0 on connector %u\n", conn_id);
+                        }
+                        drmModeFreeProperty(pr);
                     }
-                    drmModeFreeProperty(pr);
+                    drmModeFreeObjectProperties(props);
                 }
-                drmModeFreeObjectProperties(props);
             }
         }
+        drmModeFreeResources(resources);
     }
 
-    if (crtcs_to_disable > 0) {
-        int ret = drmModeAtomicCommit(fd, req, DRM_MODE_ATOMIC_ALLOW_MODESET, NULL);
-        printf("minui: disable non-main crtcs atomic commit returned %d\n", ret);
-        if (ret != 0) {
-            /* Fallback retry with NONBLOCK | ALLOW_MODESET */
-            ret = drmModeAtomicCommit(fd, req, DRM_MODE_ATOMIC_ALLOW_MODESET | DRM_MODE_ATOMIC_NONBLOCK, NULL);
-            printf("minui: fallback disable non-main crtcs returned %d\n", ret);
+    /* 3. Detach all non-main planes (Plane 65 / DMA0 continuous splash plane) */
+    drmModePlaneRes *plane_res = drmModeGetPlaneResources(fd);
+    if (plane_res) {
+        for (uint32_t i = 0; i < plane_res->count_planes; i++) {
+            uint32_t plane_id = plane_res->planes[i];
+            if (plane_id != main_plane_id) {
+                drmModeObjectProperties *props = drmModeObjectGetProperties(fd, plane_id, DRM_MODE_OBJECT_PLANE);
+                if (props) {
+                    for (uint32_t j = 0; j < props->count_props; j++) {
+                        drmModePropertyRes *pr = drmModeGetProperty(fd, props->props[j]);
+                        if (!pr) continue;
+                        if (!strcmp(pr->name, "CRTC_ID")) {
+                            drmModeAtomicAddProperty(req, plane_id, pr->prop_id, 0);
+                            printf("minui: [atomic teardown] set CRTC_ID=0 on plane %u\n", plane_id);
+                        } else if (!strcmp(pr->name, "FB_ID")) {
+                            drmModeAtomicAddProperty(req, plane_id, pr->prop_id, 0);
+                            printf("minui: [atomic teardown] set FB_ID=0 on plane %u\n", plane_id);
+                        }
+                        drmModeFreeProperty(pr);
+                    }
+                    drmModeFreeObjectProperties(props);
+                }
+            }
         }
-    } else {
-        printf("minui: no non-main CRTCs found to disable\n");
+        drmModeFreePlaneResources(plane_res);
     }
-
-    drmModeAtomicFree(req);
 }
 
 /*
@@ -699,9 +711,7 @@ static GRSurface* drm_init(minui_backend* backend __unused) {
     /* Initialize Atomic Properties & discover primary EPDC plane (g_plane_id) */
     init_atomic_properties(drm_fd, main_monitor_crtc, main_monitor_connector);
 
-    /* Disable non-main CRTCs (e.g. CRTC 112) matching stock librecovery_ui.so */
-    disable_non_main_crtcs(drm_fd, res, main_monitor_crtc);
-
+    /* Free resources */
     drmModeFreeResources(res);
 
     drm_surfaces[0] = drm_create_surface(screen_width, screen_height);
@@ -739,6 +749,14 @@ static GRSurface* drm_init(minui_backend* backend __unused) {
     if (g_has_atomic) {
         drmModeAtomicReq *req = drmModeAtomicAlloc();
         if (req) {
+            /*
+             * Atomically tear down the bootloader's continuous splash pipeline (CRTC 112,
+             * Connector 46, and Plane 65) within the very same atomic commit that activates
+             * the primary EPDC pipeline (CRTC 75, Connector 29, Plane 49).
+             * This halts Plane 65's DMA fetcher simultaneously and prevents SMMU page faults.
+             */
+            populate_non_main_teardown(drm_fd, req, main_monitor_crtc, main_monitor_connector, g_plane_id);
+
             if (prop_crtc_active)
                 drmModeAtomicAddProperty(req, main_monitor_crtc->crtc_id, prop_crtc_active, 1);
             if (prop_crtc_mode_id && g_mode_blob_id)
