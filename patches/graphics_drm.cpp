@@ -273,13 +273,9 @@ static drmModeCrtc *find_crtc_for_connector(int fd, drmModeRes *resources, drmMo
             for (j = 0; j < resources->count_crtcs; j++) {
                 if (!(encoder->possible_crtcs & (1 << j)))
                     continue;
-                /* Prefer physical EPDC display CRTC (ID 112 on Qualcomm Bengal) */
-                if (resources->crtcs[j] == 112) {
-                    crtc = resources->crtcs[j];
-                    break;
-                }
                 if (crtc < 0) {
                     crtc = resources->crtcs[j];
+                    break;
                 }
             }
             drmModeFreeEncoder(encoder);
@@ -301,16 +297,24 @@ static drmModeConnector *find_used_connector_by_type(int fd, drmModeRes *resourc
             if ((connector->connector_type == type) &&
                 (connector->connection == DRM_MODE_CONNECTED) &&
                 (connector->count_modes > 0)) {
-                /* Prioritize real physical EPDC panel (Connector 46 / DSI-2) */
-                if (connector->connector_id == 46 ||
-                    (connector->modes[0].hdisplay == 301 && connector->modes[0].vdisplay == 769)) {
-                    printf("minui: selected physical EPDC connector %d (timing %dx%d)\n",
+                /*
+                 * On Onyx Boox C69HD (Qualcomm SM6225 Bengal):
+                 * Connector 29 (DSI-1) is the command-mode EPDC interface (1024x758 @ 40Hz).
+                 * In the Qualcomm kernel (drm_mode_atomic_ioctl), user-space atomic commits
+                 * MUST target Connector 29 (is_dummy_panel = 1) in order to set state->drm_update = 1
+                 * and dispatch the 1024x758 framebuffer to __sde_plane_atomic_update_epdc.
+                 * Connector 46 (DSI-2) is the internal video-mode TCON generator (301x769)
+                 * which must NOT be bound by user-space.
+                 */
+                if (connector->connector_id == 29 ||
+                    (connector->modes[0].hdisplay == 1024 && connector->modes[0].vdisplay == 758)) {
+                    printf("minui: selected EPDC command-mode connector %d (mode %dx%d)\n",
                            connector->connector_id, connector->modes[0].hdisplay, connector->modes[0].vdisplay);
                     return connector;
                 }
-                /* Skip Qualcomm dummy virtual panel (Connector 29 / DSI-1) */
-                if (connector->connector_id == 29) {
-                    printf("minui: skipping dummy virtual connector %d (DSI-1)\n", connector->connector_id);
+                if (connector->connector_id == 46 ||
+                    (connector->modes[0].hdisplay == 301 && connector->modes[0].vdisplay == 769)) {
+                    printf("minui: skipping internal TCON video connector %d (DSI-2)\n", connector->connector_id);
                     drmModeFreeConnector(connector);
                     continue;
                 }
@@ -328,14 +332,15 @@ static drmModeConnector *find_first_connected_connector(int fd, drmModeRes *reso
         drmModeConnector *connector = drmModeGetConnector(fd, resources->connectors[i]);
         if (connector) {
             if ((connector->count_modes > 0) && (connector->connection == DRM_MODE_CONNECTED)) {
-                if (connector->connector_id == 46 ||
-                    (connector->modes[0].hdisplay == 301 && connector->modes[0].vdisplay == 769)) {
-                    printf("minui: selected physical EPDC connector %d (timing %dx%d)\n",
+                if (connector->connector_id == 29 ||
+                    (connector->modes[0].hdisplay == 1024 && connector->modes[0].vdisplay == 758)) {
+                    printf("minui: selected EPDC command-mode connector %d (mode %dx%d)\n",
                            connector->connector_id, connector->modes[0].hdisplay, connector->modes[0].vdisplay);
                     return connector;
                 }
-                if (connector->connector_id == 29) {
-                    printf("minui: skipping dummy virtual connector %d (DSI-1)\n", connector->connector_id);
+                if (connector->connector_id == 46 ||
+                    (connector->modes[0].hdisplay == 301 && connector->modes[0].vdisplay == 769)) {
+                    printf("minui: skipping internal TCON video connector %d (DSI-2)\n", connector->connector_id);
                     drmModeFreeConnector(connector);
                     continue;
                 }
@@ -662,15 +667,13 @@ static GRSurface* drm_init(minui_backend* backend __unused) {
 
     /*
      * For Onyx Boox C69HD (Qualcomm SM6225 Bengal):
-     * The physical EPDC timing over DSI is hactive x vactive (301x769 @ 90Hz).
-     * The Qualcomm SDE kernel driver validates crtc_w <= mode.hdisplay and
-     * rejects any atomic commit exceeding hdisplay with -E2BIG (-7).
+     * Connector 29 provides the EPDC command-mode resolution (1024x758 @ 40Hz).
      * Matching stock librecovery_ui.so, we set screen_width and screen_height
-     * directly from the CRTC display timing mode.
+     * directly from the CRTC display mode (1024x758).
      */
     screen_width = main_monitor_crtc->mode.hdisplay;
     screen_height = main_monitor_crtc->mode.vdisplay;
-    printf("minui: Physical display resolution: %dx%d @ %d Hz\n",
+    printf("minui: Display resolution: %dx%d @ %d Hz\n",
            screen_width, screen_height, main_monitor_crtc->mode.vrefresh);
 
     /* Initialize Atomic Properties & discover primary EPDC plane (g_plane_id) */
