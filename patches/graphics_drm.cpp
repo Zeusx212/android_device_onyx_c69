@@ -182,22 +182,15 @@ static drm_surface *drm_create_surface(int width, int height) {
         return NULL;
     }
 
-#if defined(RECOVERY_ABGR)
-    format = DRM_FORMAT_RGBA8888;
-    base_format = GGL_PIXEL_FORMAT_RGBA_8888;
-#elif defined(RECOVERY_BGRA)
-    format = DRM_FORMAT_ARGB8888;
-    base_format = GGL_PIXEL_FORMAT_RGBA_8888;
-#elif defined(RECOVERY_RGBA)
+    /*
+     * For Onyx Boox C69HD (Qualcomm SM6225 Bengal):
+     * The Qualcomm EPDC kernel driver (msm_framebuffer_create_waveform)
+     * allocates hardware waveform buffers exclusively for DRM_FORMAT_ABGR8888 (AB24 = 875708993).
+     * Any other pixel format (such as RGBA8888 / RA24) skips waveform allocation,
+     * causing waveform_framebuffer_lookup() to return NULL and dropping all scanout.
+     */
     format = DRM_FORMAT_ABGR8888;
-    base_format = GGL_PIXEL_FORMAT_BGRA_8888;
-#elif defined(RECOVERY_RGBX)
-    format = DRM_FORMAT_XBGR8888;
     base_format = GGL_PIXEL_FORMAT_RGBA_8888;
-#else
-    format = DRM_FORMAT_RGBA8888;
-    base_format = GGL_PIXEL_FORMAT_RGBA_8888;
-#endif
 
     memset(&create_dumb, 0, sizeof(create_dumb));
     create_dumb.height = height;
@@ -464,83 +457,100 @@ static void teardown_non_main_pipeline(int fd, drmModeRes *resources, drmModeCrt
  * Discover and cache Qualcomm Atomic DRM Plane, CRTC, and EPDC properties.
  */
 static void init_atomic_properties(int fd, drmModeCrtc *crtc, drmModeConnector *conn) {
-    drmModePlaneRes *plane_res = drmModeGetPlaneResources(fd);
-    if (!plane_res) {
-        printf("minui: drmModeGetPlaneResources returned NULL; atomic disabled\n");
+    g_plane_id = 0;
+
+    /*
+     * Prioritize hardware EPDC plane 49 for CRTC 112 on Qualcomm Bengal.
+     * The Qualcomm Onyx EPDC kernel driver intentionally hides Plane 49
+     * from drmModeGetPlaneResources() to prevent userspace/HWC misuse,
+     * which causes standard plane enumeration to mistakenly select Plane 65 (pipe 9).
+     * Selecting Plane 65 on CRTC 112 causes:
+     *   "invalid src split cfg, stage:0 left:65 right:49" (-22 / EINVAL)
+     * and fails EPDC hardware dispatch (get_sde_kms_epdc_plane_id() == 49).
+     */
+    drmModePlane *epdc_plane = drmModeGetPlane(fd, 49);
+    if (epdc_plane) {
+        g_plane_id = 49;
+        drmModeFreePlane(epdc_plane);
+        printf("minui: successfully bound to Qualcomm EPDC Plane %u\n", g_plane_id);
+    } else {
+        printf("minui: Plane 49 lookup failed, falling back to plane resources\n");
+        drmModePlaneRes *plane_res = drmModeGetPlaneResources(fd);
+        if (plane_res) {
+            uint32_t crtc_mask = 0;
+            drmModeRes *res = drmModeGetResources(fd);
+            if (res) {
+                for (int i = 0; i < res->count_crtcs; i++) {
+                    if (res->crtcs[i] == crtc->crtc_id) {
+                        crtc_mask = (1 << i);
+                        break;
+                    }
+                }
+                drmModeFreeResources(res);
+            }
+            /* Match stock librecovery_ui.so: skip plane 0 (plane 65) if multiple planes exist */
+            uint32_t start_idx = (plane_res->count_planes > 1) ? 1 : 0;
+            for (uint32_t i = start_idx; i < plane_res->count_planes; i++) {
+                drmModePlane *plane = drmModeGetPlane(fd, plane_res->planes[i]);
+                if (!plane) continue;
+                if (crtc_mask && !(plane->possible_crtcs & crtc_mask)) {
+                    drmModeFreePlane(plane);
+                    continue;
+                }
+                g_plane_id = plane->plane_id;
+                drmModeFreePlane(plane);
+                break;
+            }
+            drmModeFreePlaneResources(plane_res);
+        }
+    }
+
+    if (!g_plane_id) {
+        printf("minui: No suitable DRM plane found!\n");
         return;
     }
 
-    uint32_t crtc_mask = 0;
-    drmModeRes *res = drmModeGetResources(fd);
-    if (res) {
-        for (int i = 0; i < res->count_crtcs; i++) {
-            if (res->crtcs[i] == crtc->crtc_id) {
-                crtc_mask = (1 << i);
-                break;
-            }
+    /* Fetch Plane Properties */
+    drmModeObjectProperties *props = drmModeObjectGetProperties(fd, g_plane_id, DRM_MODE_OBJECT_PLANE);
+    if (props) {
+        for (uint32_t j = 0; j < props->count_props; j++) {
+            drmModePropertyRes *pr = drmModeGetProperty(fd, props->props[j]);
+            if (!pr) continue;
+
+            if (!strcmp(pr->name, "FB_ID"))
+                prop_plane_fb_id = pr->prop_id;
+            else if (!strcmp(pr->name, "CRTC_ID"))
+                prop_plane_crtc_id = pr->prop_id;
+            else if (!strcmp(pr->name, "CRTC_X"))
+                prop_plane_crtc_x = pr->prop_id;
+            else if (!strcmp(pr->name, "CRTC_Y"))
+                prop_plane_crtc_y = pr->prop_id;
+            else if (!strcmp(pr->name, "CRTC_W"))
+                prop_plane_crtc_w = pr->prop_id;
+            else if (!strcmp(pr->name, "CRTC_H"))
+                prop_plane_crtc_h = pr->prop_id;
+            else if (!strcmp(pr->name, "SRC_X"))
+                prop_plane_src_x = pr->prop_id;
+            else if (!strcmp(pr->name, "SRC_Y"))
+                prop_plane_src_y = pr->prop_id;
+            else if (!strcmp(pr->name, "SRC_W"))
+                prop_plane_src_w = pr->prop_id;
+            else if (!strcmp(pr->name, "SRC_H"))
+                prop_plane_src_h = pr->prop_id;
+            else if (!strcmp(pr->name, "zpos"))
+                prop_plane_zpos = pr->prop_id;
+            else if (!strcmp(pr->name, "EPDC_UPDATE_PARMS_ADDR"))
+                prop_epdc_parms_addr = pr->prop_id;
+            else if (!strcmp(pr->name, "EPDC_UPDATE_CNT"))
+                prop_epdc_cnt = pr->prop_id;
+
+            drmModeFreeProperty(pr);
         }
-        drmModeFreeResources(res);
+        drmModeFreeObjectProperties(props);
     }
 
-    /* Find matching primary plane for this CRTC */
-    for (uint32_t i = 0; i < plane_res->count_planes; i++) {
-        drmModePlane *plane = drmModeGetPlane(fd, plane_res->planes[i]);
-        if (!plane) continue;
-
-        if (crtc_mask && !(plane->possible_crtcs & crtc_mask)) {
-            drmModeFreePlane(plane);
-            continue;
-        }
-
-        g_plane_id = plane->plane_id;
-        drmModeObjectProperties *props = drmModeObjectGetProperties(fd, g_plane_id, DRM_MODE_OBJECT_PLANE);
-        if (props) {
-            for (uint32_t j = 0; j < props->count_props; j++) {
-                drmModePropertyRes *pr = drmModeGetProperty(fd, props->props[j]);
-                if (!pr) continue;
-
-                if (!strcmp(pr->name, "FB_ID"))
-                    prop_plane_fb_id = pr->prop_id;
-                else if (!strcmp(pr->name, "CRTC_ID"))
-                    prop_plane_crtc_id = pr->prop_id;
-                else if (!strcmp(pr->name, "CRTC_X"))
-                    prop_plane_crtc_x = pr->prop_id;
-                else if (!strcmp(pr->name, "CRTC_Y"))
-                    prop_plane_crtc_y = pr->prop_id;
-                else if (!strcmp(pr->name, "CRTC_W"))
-                    prop_plane_crtc_w = pr->prop_id;
-                else if (!strcmp(pr->name, "CRTC_H"))
-                    prop_plane_crtc_h = pr->prop_id;
-                else if (!strcmp(pr->name, "SRC_X"))
-                    prop_plane_src_x = pr->prop_id;
-                else if (!strcmp(pr->name, "SRC_Y"))
-                    prop_plane_src_y = pr->prop_id;
-                else if (!strcmp(pr->name, "SRC_W"))
-                    prop_plane_src_w = pr->prop_id;
-                else if (!strcmp(pr->name, "SRC_H"))
-                    prop_plane_src_h = pr->prop_id;
-                else if (!strcmp(pr->name, "zpos"))
-                    prop_plane_zpos = pr->prop_id;
-                else if (!strcmp(pr->name, "EPDC_UPDATE_PARMS_ADDR"))
-                    prop_epdc_parms_addr = pr->prop_id;
-                else if (!strcmp(pr->name, "EPDC_UPDATE_CNT"))
-                    prop_epdc_cnt = pr->prop_id;
-
-                drmModeFreeProperty(pr);
-            }
-            drmModeFreeObjectProperties(props);
-        }
-
-        drmModeFreePlane(plane);
-
-        /* Stop once we find the EPDC plane or any plane that has FB_ID */
-        if (prop_epdc_parms_addr && prop_epdc_cnt) {
-            printf("minui: Found Qualcomm EPDC Plane %u (PARMS_ADDR=%u, CNT=%u)\n",
-                   g_plane_id, prop_epdc_parms_addr, prop_epdc_cnt);
-            break;
-        }
-    }
-    drmModeFreePlaneResources(plane_res);
+    printf("minui: Plane %u properties: FB_ID=%u, CRTC_ID=%u, EPDC_ADDR=%u, EPDC_CNT=%u\n",
+           g_plane_id, prop_plane_fb_id, prop_plane_crtc_id, prop_epdc_parms_addr, prop_epdc_cnt);
 
     /* Fetch CRTC Properties */
     drmModeObjectProperties *crtc_props = drmModeObjectGetProperties(fd, crtc->crtc_id, DRM_MODE_OBJECT_CRTC);
@@ -827,8 +837,13 @@ static GRSurface* drm_flip(minui_backend* backend __unused) {
                 ret = drmModeAtomicCommit(drm_fd, req, DRM_MODE_ATOMIC_ALLOW_MODESET, NULL);
             }
 
+            static bool s_first_flip = true;
             if (ret == 0) {
                 commit_ok = true;
+                if (s_first_flip) {
+                    printf("minui: first atomic EPDC flip committed successfully!\n");
+                    s_first_flip = false;
+                }
             } else {
                 printf("minui: drmModeAtomicCommit flip returned error %d\n", ret);
             }
