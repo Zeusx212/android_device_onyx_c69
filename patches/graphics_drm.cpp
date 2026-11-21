@@ -411,48 +411,52 @@ static void init_atomic_properties(int fd, drmModeCrtc *crtc, drmModeConnector *
     g_plane_id = 0;
 
     /*
-     * Prioritize hardware EPDC plane 49 for CRTC 75 on Qualcomm Bengal.
-     * The Qualcomm Onyx EPDC kernel driver intentionally hides Plane 49
-     * from drmModeGetPlaneResources() to prevent userspace/HWC misuse,
-     * which causes standard plane enumeration to mistakenly select Plane 65 (pipe 9).
-     * Selecting Plane 65 on CRTC 75 causes:
-     *   "invalid src split cfg, stage:0 left:65 right:49" (-22 / EINVAL)
-     * and fails EPDC hardware dispatch (get_sde_kms_epdc_plane_id() == 49).
+     * Match stock librecovery_ui.so MinuiBackendDrm::Init():
+     * Enumerate planes via drmModeGetPlaneResources().
+     * Plane index 0 (Plane 65 / SSPP DMA0) is the bootloader's continuous splash plane
+     * and is explicitly skipped by stock recovery (0x36a50: cbz x23).
+     * Stock recovery binds to plane index 1 (Plane 68 / SSPP ViG0), which is the
+     * primary graphics scanout plane for CRTC 75 and carries EPDC_UPDATE_CNT / EPDC_UPDATE_PARMS_ADDR.
+     * Plane 49 is an internal hardware plane reserved for the kernel's onyx_epdc_fb driver.
      */
-    drmModePlane *epdc_plane = drmModeGetPlane(fd, 49);
-    if (epdc_plane) {
-        g_plane_id = 49;
-        drmModeFreePlane(epdc_plane);
-        printf("minui: successfully bound to Qualcomm EPDC Plane %u\n", g_plane_id);
-    } else {
-        printf("minui: Plane 49 lookup failed, falling back to plane resources\n");
-        drmModePlaneRes *plane_res = drmModeGetPlaneResources(fd);
-        if (plane_res) {
-            uint32_t crtc_mask = 0;
-            drmModeRes *res = drmModeGetResources(fd);
-            if (res) {
-                for (int i = 0; i < res->count_crtcs; i++) {
-                    if (res->crtcs[i] == crtc->crtc_id) {
-                        crtc_mask = (1 << i);
-                        break;
-                    }
+    drmModePlaneRes *plane_res = drmModeGetPlaneResources(fd);
+    if (plane_res) {
+        uint32_t crtc_mask = 0;
+        drmModeRes *res = drmModeGetResources(fd);
+        if (res) {
+            for (int i = 0; i < res->count_crtcs; i++) {
+                if (res->crtcs[i] == crtc->crtc_id) {
+                    crtc_mask = (1 << i);
+                    break;
                 }
-                drmModeFreeResources(res);
             }
-            /* Match stock librecovery_ui.so: skip plane 0 (plane 65) if multiple planes exist */
-            uint32_t start_idx = (plane_res->count_planes > 1) ? 1 : 0;
-            for (uint32_t i = start_idx; i < plane_res->count_planes; i++) {
-                drmModePlane *plane = drmModeGetPlane(fd, plane_res->planes[i]);
-                if (!plane) continue;
-                if (crtc_mask && !(plane->possible_crtcs & crtc_mask)) {
-                    drmModeFreePlane(plane);
-                    continue;
-                }
-                g_plane_id = plane->plane_id;
+            drmModeFreeResources(res);
+        }
+
+        uint32_t start_idx = (plane_res->count_planes > 1) ? 1 : 0;
+        for (uint32_t i = start_idx; i < plane_res->count_planes; i++) {
+            drmModePlane *plane = drmModeGetPlane(fd, plane_res->planes[i]);
+            if (!plane) continue;
+            if (crtc_mask && !(plane->possible_crtcs & crtc_mask)) {
                 drmModeFreePlane(plane);
-                break;
+                continue;
             }
-            drmModeFreePlaneResources(plane_res);
+            g_plane_id = plane->plane_id;
+            printf("minui: selected stock recovery graphics Plane %u (res_index %u, possible_crtcs=0x%x)\n",
+                   g_plane_id, i, plane->possible_crtcs);
+            drmModeFreePlane(plane);
+            break;
+        }
+        drmModeFreePlaneResources(plane_res);
+    }
+
+    if (!g_plane_id) {
+        /* Fallback: direct lookup of Plane 68 if plane resources enumeration was empty */
+        drmModePlane *p68 = drmModeGetPlane(fd, 68);
+        if (p68) {
+            g_plane_id = 68;
+            drmModeFreePlane(p68);
+            printf("minui: successfully bound to primary graphics Plane %u (fallback)\n", g_plane_id);
         }
     }
 
@@ -707,8 +711,21 @@ static GRSurface* drm_init(minui_backend* backend __unused) {
                 drmModeAtomicAddProperty(req, g_plane_id, prop_epdc_cnt, 1);
             }
 
-            int ret = drmModeAtomicCommit(drm_fd, req, DRM_MODE_ATOMIC_ALLOW_MODESET, NULL);
-            if (ret) {
+            /*
+             * Stock librecovery_ui.so MinuiBackendDrm::Blank(false) commits SetupPipeline
+             * with DRM_MODE_ATOMIC_NONBLOCK (0x400) to avoid triggering a destructive
+             * continuous splash resource teardown in Qualcomm SDE KMS.
+             */
+            int ret = drmModeAtomicCommit(drm_fd, req, DRM_MODE_ATOMIC_NONBLOCK, NULL);
+            if (ret != 0) {
+                printf("minui: initial nonblock commit returned %d, retrying with blocking commit\n", ret);
+                ret = drmModeAtomicCommit(drm_fd, req, 0, NULL);
+            }
+            if (ret != 0) {
+                printf("minui: initial blocking commit returned %d, retrying with ALLOW_MODESET\n", ret);
+                ret = drmModeAtomicCommit(drm_fd, req, DRM_MODE_ATOMIC_ALLOW_MODESET, NULL);
+            }
+            if (ret != 0) {
                 printf("minui: initial atomic commit returned %d, attempting legacy drmModeSetCrtc fallback\n", ret);
                 drm_enable_crtc(drm_fd, main_monitor_crtc, drm_surfaces[1]);
             } else {
