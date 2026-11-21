@@ -266,6 +266,7 @@ static drmModeCrtc *find_crtc_for_connector(int fd, drmModeRes *resources, drmMo
     if (encoder && encoder->crtc_id) {
         crtc = encoder->crtc_id;
         drmModeFreeEncoder(encoder);
+        printf("minui: connector %d using active encoder crtc %d\n", connector->connector_id, crtc);
         return drmModeGetCrtc(fd, crtc);
     }
 
@@ -278,8 +279,8 @@ static drmModeCrtc *find_crtc_for_connector(int fd, drmModeRes *resources, drmMo
             for (j = 0; j < resources->count_crtcs; j++) {
                 if (!(encoder->possible_crtcs & (1 << j)))
                     continue;
-                /* Prefer primary EPDC display CRTC (ID 75 on Qualcomm Bengal) */
-                if (resources->crtcs[j] == 75) {
+                /* Prefer physical EPDC display CRTC (ID 112 on Qualcomm Bengal) */
+                if (resources->crtcs[j] == 112) {
                     crtc = resources->crtcs[j];
                     break;
                 }
@@ -288,8 +289,10 @@ static drmModeCrtc *find_crtc_for_connector(int fd, drmModeRes *resources, drmMo
                 }
             }
             drmModeFreeEncoder(encoder);
-            if (crtc >= 0)
+            if (crtc >= 0) {
+                printf("minui: connector %d mapped to crtc %d\n", connector->connector_id, crtc);
                 return drmModeGetCrtc(fd, crtc);
+            }
         }
     }
 
@@ -304,13 +307,18 @@ static drmModeConnector *find_used_connector_by_type(int fd, drmModeRes *resourc
             if ((connector->connector_type == type) &&
                 (connector->connection == DRM_MODE_CONNECTED) &&
                 (connector->count_modes > 0)) {
-                /* Skip Qualcomm dummy/stale video panels (e.g. 301x769) */
-                if (type == DRM_MODE_CONNECTOR_DSI && connector->count_modes > 0) {
-                    if (connector->modes[0].hdisplay == 301 && connector->modes[0].vdisplay == 769) {
-                        printf("minui: skipping dummy video connector %d (301x769)\n", connector->connector_id);
-                        drmModeFreeConnector(connector);
-                        continue;
-                    }
+                /* Prioritize real physical EPDC panel (Connector 46 / DSI-2) */
+                if (connector->connector_id == 46 ||
+                    (connector->modes[0].hdisplay == 301 && connector->modes[0].vdisplay == 769)) {
+                    printf("minui: selected physical EPDC connector %d (timing %dx%d)\n",
+                           connector->connector_id, connector->modes[0].hdisplay, connector->modes[0].vdisplay);
+                    return connector;
+                }
+                /* Skip Qualcomm dummy virtual panel (Connector 29 / DSI-1) */
+                if (connector->connector_id == 29) {
+                    printf("minui: skipping dummy virtual connector %d (DSI-1)\n", connector->connector_id);
+                    drmModeFreeConnector(connector);
+                    continue;
                 }
                 return connector;
             }
@@ -326,8 +334,14 @@ static drmModeConnector *find_first_connected_connector(int fd, drmModeRes *reso
         drmModeConnector *connector = drmModeGetConnector(fd, resources->connectors[i]);
         if (connector) {
             if ((connector->count_modes > 0) && (connector->connection == DRM_MODE_CONNECTED)) {
-                if (connector->modes[0].hdisplay == 301 && connector->modes[0].vdisplay == 769) {
-                    printf("minui: skipping dummy video connector %d (301x769)\n", connector->connector_id);
+                if (connector->connector_id == 46 ||
+                    (connector->modes[0].hdisplay == 301 && connector->modes[0].vdisplay == 769)) {
+                    printf("minui: selected physical EPDC connector %d (timing %dx%d)\n",
+                           connector->connector_id, connector->modes[0].hdisplay, connector->modes[0].vdisplay);
+                    return connector;
+                }
+                if (connector->connector_id == 29) {
+                    printf("minui: skipping dummy virtual connector %d (DSI-1)\n", connector->connector_id);
                     drmModeFreeConnector(connector);
                     continue;
                 }
@@ -380,8 +394,14 @@ static void disable_non_main_crtcs(int fd, drmModeRes *resources, drmModeCrtc *m
 
         drmModeCrtc *crtc = find_crtc_for_connector(fd, resources, connector);
         if (crtc) {
-            if (crtc->crtc_id != main_crtc->crtc_id)
-                drm_disable_crtc(fd, crtc);
+            if (crtc->crtc_id != main_crtc->crtc_id) {
+                if (crtc->crtc_id == 112) {
+                    printf("minui: NEVER disable physical EPDC CRTC 112!\n");
+                } else {
+                    printf("minui: disabling secondary non-main crtc %d\n", crtc->crtc_id);
+                    drm_disable_crtc(fd, crtc);
+                }
+            }
             drmModeFreeCrtc(crtc);
         }
         drmModeFreeConnector(connector);
@@ -577,10 +597,26 @@ static GRSurface* drm_init(minui_backend* backend __unused) {
     disable_non_main_crtcs(drm_fd, res, main_monitor_crtc);
     main_monitor_crtc->mode = main_monitor_connector->modes[selected_mode];
 
-    screen_width = main_monitor_crtc->mode.hdisplay;
-    screen_height = main_monitor_crtc->mode.vdisplay;
-    printf("minui: Screen resolution detected: %dx%d @ %d Hz\n",
-           screen_width, screen_height, main_monitor_crtc->mode.vrefresh);
+    /*
+     * For Onyx Boox C69HD (Qualcomm SM6225 Bengal):
+     * The physical E-Ink panel resolution is 1024x758.
+     * The DSI interface between DPU and EPDC FPGA runs at 301x769 timing mode,
+     * but the kernel __sde_plane_atomic_update_epdc driver requires the plane
+     * dimensions and framebuffer to be exactly 1024x758.
+     */
+    if ((main_monitor_crtc->mode.hdisplay == 301 && main_monitor_crtc->mode.vdisplay == 769) ||
+        main_monitor_connector->connector_id == 46) {
+        screen_width = 1024;
+        screen_height = 758;
+        printf("minui: Onyx Boox EPDC detected: DSI timing %dx%d @ %d Hz, E-Ink canvas: %dx%d\n",
+               main_monitor_crtc->mode.hdisplay, main_monitor_crtc->mode.vdisplay,
+               main_monitor_crtc->mode.vrefresh, screen_width, screen_height);
+    } else {
+        screen_width = main_monitor_crtc->mode.hdisplay;
+        screen_height = main_monitor_crtc->mode.vdisplay;
+        printf("minui: Screen resolution detected: %dx%d @ %d Hz\n",
+               screen_width, screen_height, main_monitor_crtc->mode.vrefresh);
+    }
 
     drmModeFreeResources(res);
 
@@ -642,10 +678,10 @@ static GRSurface* drm_init(minui_backend* backend __unused) {
                 g_epdc_parms[0].rect[1] = 0;
                 g_epdc_parms[0].rect[2] = screen_width;
                 g_epdc_parms[0].rect[3] = screen_height;
-                g_epdc_parms[0].waveform_mode = 2; // GC16 full refresh
+                g_epdc_parms[0].waveform_mode = 2; // GC16 full refresh on boot
                 g_epdc_parms[0].update_mode = 0;
                 g_epdc_parms[0].update_marker = ++g_update_marker;
-                g_epdc_parms[0].flag = 0x21000;
+                g_epdc_parms[0].flag = 0;
 
                 drmModeAtomicAddProperty(req, g_plane_id, prop_epdc_parms_addr, (uint64_t)(uintptr_t)&g_epdc_parms[0]);
                 drmModeAtomicAddProperty(req, g_plane_id, prop_epdc_cnt, 1);
@@ -691,10 +727,10 @@ static GRSurface* drm_flip(minui_backend* backend __unused) {
                 g_epdc_parms[0].rect[1] = 0;
                 g_epdc_parms[0].rect[2] = screen_width;
                 g_epdc_parms[0].rect[3] = screen_height;
-                g_epdc_parms[0].waveform_mode = 2; // GC16
+                g_epdc_parms[0].waveform_mode = 255; // Auto waveform for fast page flip
                 g_epdc_parms[0].update_mode = 0;
                 g_epdc_parms[0].update_marker = ++g_update_marker;
-                g_epdc_parms[0].flag = 0x21000;
+                g_epdc_parms[0].flag = 0;
 
                 drmModeAtomicAddProperty(req, g_plane_id, prop_epdc_parms_addr, (uint64_t)(uintptr_t)&g_epdc_parms[0]);
                 drmModeAtomicAddProperty(req, g_plane_id, prop_epdc_cnt, 1);
