@@ -405,103 +405,17 @@ static drmModeConnector *find_main_monitor(int fd, drmModeRes *resources, uint32
 }
 
 /*
- * Populate teardown properties for non-main pipeline components directly into the modeset atomic request.
- * On Onyx Boox C69HD, the bootloader leaves continuous splash active on CRTC 112, Connector 46,
- * and Plane 65 (SSPP DMA0) fetching splash image data from 0x5c000000.
- * In DRM Atomic KMS, continuous splash must be torn down simultaneously within the very same
- * atomic commit that activates CRTC 75, Connector 29, and Plane 49.
- * This atomically halts the Plane 65 DMA fetcher, deactivates CRTC 112, unbinds Connector 46,
- * and eliminates the Qualcomm MDP SMMU page fault on 0x5c000000.
- */
-static void populate_non_main_teardown(int fd, drmModeAtomicReq *req, drmModeCrtc *main_crtc,
-                                       drmModeConnector *main_conn, uint32_t main_plane_id) {
-    /* 1. Deactivate all non-main CRTCs (CRTC 112) */
-    drmModeRes *resources = drmModeGetResources(fd);
-    if (resources) {
-        for (int i = 0; i < resources->count_crtcs; i++) {
-            uint32_t crtc_id = resources->crtcs[i];
-            if (crtc_id != main_crtc->crtc_id) {
-                drmModeObjectProperties *props = drmModeObjectGetProperties(fd, crtc_id, DRM_MODE_OBJECT_CRTC);
-                if (props) {
-                    for (uint32_t j = 0; j < props->count_props; j++) {
-                        drmModePropertyRes *pr = drmModeGetProperty(fd, props->props[j]);
-                        if (!pr) continue;
-                        if (!strcmp(pr->name, "ACTIVE")) {
-                            drmModeAtomicAddProperty(req, crtc_id, pr->prop_id, 0);
-                            printf("minui: [atomic teardown] set ACTIVE=0 on CRTC %u\n", crtc_id);
-                        } else if (!strcmp(pr->name, "MODE_ID")) {
-                            drmModeAtomicAddProperty(req, crtc_id, pr->prop_id, 0);
-                            printf("minui: [atomic teardown] set MODE_ID=0 on CRTC %u\n", crtc_id);
-                        }
-                        drmModeFreeProperty(pr);
-                    }
-                    drmModeFreeObjectProperties(props);
-                }
-            }
-        }
-
-        /* 2. Disconnect all non-main connectors (Connector 46 / DSI-2) */
-        for (int i = 0; i < resources->count_connectors; i++) {
-            uint32_t conn_id = resources->connectors[i];
-            if (main_conn && conn_id != main_conn->connector_id) {
-                drmModeObjectProperties *props = drmModeObjectGetProperties(fd, conn_id, DRM_MODE_OBJECT_CONNECTOR);
-                if (props) {
-                    for (uint32_t j = 0; j < props->count_props; j++) {
-                        drmModePropertyRes *pr = drmModeGetProperty(fd, props->props[j]);
-                        if (!pr) continue;
-                        if (!strcmp(pr->name, "CRTC_ID")) {
-                            drmModeAtomicAddProperty(req, conn_id, pr->prop_id, 0);
-                            printf("minui: [atomic teardown] set CRTC_ID=0 on connector %u\n", conn_id);
-                        }
-                        drmModeFreeProperty(pr);
-                    }
-                    drmModeFreeObjectProperties(props);
-                }
-            }
-        }
-        drmModeFreeResources(resources);
-    }
-
-    /* 3. Detach all non-main planes (Plane 65 / DMA0 continuous splash plane) */
-    drmModePlaneRes *plane_res = drmModeGetPlaneResources(fd);
-    if (plane_res) {
-        for (uint32_t i = 0; i < plane_res->count_planes; i++) {
-            uint32_t plane_id = plane_res->planes[i];
-            if (plane_id != main_plane_id) {
-                drmModeObjectProperties *props = drmModeObjectGetProperties(fd, plane_id, DRM_MODE_OBJECT_PLANE);
-                if (props) {
-                    for (uint32_t j = 0; j < props->count_props; j++) {
-                        drmModePropertyRes *pr = drmModeGetProperty(fd, props->props[j]);
-                        if (!pr) continue;
-                        if (!strcmp(pr->name, "CRTC_ID")) {
-                            drmModeAtomicAddProperty(req, plane_id, pr->prop_id, 0);
-                            printf("minui: [atomic teardown] set CRTC_ID=0 on plane %u\n", plane_id);
-                        } else if (!strcmp(pr->name, "FB_ID")) {
-                            drmModeAtomicAddProperty(req, plane_id, pr->prop_id, 0);
-                            printf("minui: [atomic teardown] set FB_ID=0 on plane %u\n", plane_id);
-                        }
-                        drmModeFreeProperty(pr);
-                    }
-                    drmModeFreeObjectProperties(props);
-                }
-            }
-        }
-        drmModeFreePlaneResources(plane_res);
-    }
-}
-
-/*
  * Discover and cache Qualcomm Atomic DRM Plane, CRTC, and EPDC properties.
  */
 static void init_atomic_properties(int fd, drmModeCrtc *crtc, drmModeConnector *conn) {
     g_plane_id = 0;
 
     /*
-     * Prioritize hardware EPDC plane 49 for CRTC 112 on Qualcomm Bengal.
+     * Prioritize hardware EPDC plane 49 for CRTC 75 on Qualcomm Bengal.
      * The Qualcomm Onyx EPDC kernel driver intentionally hides Plane 49
      * from drmModeGetPlaneResources() to prevent userspace/HWC misuse,
      * which causes standard plane enumeration to mistakenly select Plane 65 (pipe 9).
-     * Selecting Plane 65 on CRTC 112 causes:
+     * Selecting Plane 65 on CRTC 75 causes:
      *   "invalid src split cfg, stage:0 left:65 right:49" (-22 / EINVAL)
      * and fails EPDC hardware dispatch (get_sde_kms_epdc_plane_id() == 49).
      */
@@ -750,12 +664,13 @@ static GRSurface* drm_init(minui_backend* backend __unused) {
         drmModeAtomicReq *req = drmModeAtomicAlloc();
         if (req) {
             /*
-             * Atomically tear down the bootloader's continuous splash pipeline (CRTC 112,
-             * Connector 46, and Plane 65) within the very same atomic commit that activates
-             * the primary EPDC pipeline (CRTC 75, Connector 29, Plane 49).
-             * This halts Plane 65's DMA fetcher simultaneously and prevents SMMU page faults.
+             * Modeset EPDC command-mode pipeline (CRTC 75, Connector 29, Plane 49).
+             * Note: We intentionally do NOT touch CRTC 112 / Connector 46 (DSI-2)
+             * or Plane 65 in userspace. On Onyx Boox C69HD, CRTC 112 / DSI-2 is the
+             * hardware EPDC TCON link and carries continuous splash. SurfaceFlinger
+             * in stock Android also leaves CRTC 112 untouched. Touching CRTC 112
+             * causes Qualcomm SMMU page faults and EPDC TCON communication failure.
              */
-            populate_non_main_teardown(drm_fd, req, main_monitor_crtc, main_monitor_connector, g_plane_id);
 
             if (prop_crtc_active)
                 drmModeAtomicAddProperty(req, main_monitor_crtc->crtc_id, prop_crtc_active, 1);
