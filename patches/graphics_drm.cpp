@@ -784,6 +784,27 @@ static GRSurface* drm_init(minui_backend* backend __unused) {
                 printf("minui: initial atomic commit with EPDC refresh successful!\n");
             }
             drmModeAtomicFree(req);
+
+            /* Enable verbose EPDC debugging in kernel for diagnostics */
+            int fd_debug = open("/sys/devices/platform/onyx_epdc_fb.0/debug_level", O_WRONLY);
+            if (fd_debug >= 0) {
+                write(fd_debug, "255\n", 4);
+                close(fd_debug);
+            }
+
+            /*
+             * Wake up EPDC hardware and clear continuous splash frame.
+             * Reading /sys/devices/platform/onyx_epdc_fb.0/panel_clean forces
+             * the Qualcomm Onyx EPDC driver to initialize the waveform pipeline
+             * and clears the static bootloader splash screen.
+             */
+            int fd_clean = open("/sys/devices/platform/onyx_epdc_fb.0/panel_clean", O_RDONLY);
+            if (fd_clean >= 0) {
+                char buf[32];
+                read(fd_clean, buf, sizeof(buf));
+                close(fd_clean);
+                printf("minui: triggered initial hardware panel_clean\n");
+            }
         }
     } else {
         drm_enable_crtc(drm_fd, main_monitor_crtc, drm_surfaces[1]);
@@ -802,6 +823,22 @@ static GRSurface* drm_flip(minui_backend* backend __unused) {
     if (g_has_atomic) {
         drmModeAtomicReq *req = drmModeAtomicAlloc();
         if (req) {
+            /* Match stock librecovery_ui.so MinuiBackendDrm::UpdatePlaneFB:
+             * 1. Add connector CRTC_ID if present.
+             * 2. Set FB_ID and CRTC_ID on Plane 49.
+             * 3. Attach EPDC update parameters:
+             *    - rect = { 0, 0, screen_width, screen_height }
+             *    - waveform_mode = 2 (GC16)
+             *    - update_mode = 0 (full)
+             *    - update_marker = ++g_update_marker (strictly > 0)
+             *    - temp = 24 (24C ambient temp index)
+             *    - flag = 0
+             * 4. Commit with DRM_MODE_ATOMIC_NONBLOCK (0x400)!
+             */
+            if (prop_conn_crtc_id && main_monitor_connector && main_monitor_crtc) {
+                drmModeAtomicAddProperty(req, main_monitor_connector->connector_id, prop_conn_crtc_id, main_monitor_crtc->crtc_id);
+            }
+
             drmModeAtomicAddProperty(req, g_plane_id, prop_plane_fb_id, drm_surfaces[current_buffer]->fb_id);
             drmModeAtomicAddProperty(req, g_plane_id, prop_plane_crtc_id, main_monitor_crtc->crtc_id);
             if (prop_plane_zpos) drmModeAtomicAddProperty(req, g_plane_id, prop_plane_zpos, 0);
@@ -831,17 +868,21 @@ static GRSurface* drm_flip(minui_backend* backend __unused) {
                 drmModeAtomicAddProperty(req, g_plane_id, prop_epdc_cnt, 1);
             }
 
-            int ret = drmModeAtomicCommit(drm_fd, req, 0, NULL);
+            /* Stock recovery ALWAYS commits with DRM_MODE_ATOMIC_NONBLOCK (0x400) */
+            int ret = drmModeAtomicCommit(drm_fd, req, DRM_MODE_ATOMIC_NONBLOCK, NULL);
             if (ret != 0) {
-                /* Retry with ALLOW_MODESET if non-modeset atomic flip rejected */
-                ret = drmModeAtomicCommit(drm_fd, req, DRM_MODE_ATOMIC_ALLOW_MODESET, NULL);
+                /* Retry with standard blocking or ALLOW_MODESET if nonblock rejected */
+                ret = drmModeAtomicCommit(drm_fd, req, 0, NULL);
+                if (ret != 0) {
+                    ret = drmModeAtomicCommit(drm_fd, req, DRM_MODE_ATOMIC_ALLOW_MODESET, NULL);
+                }
             }
 
             static bool s_first_flip = true;
             if (ret == 0) {
                 commit_ok = true;
                 if (s_first_flip) {
-                    printf("minui: first atomic EPDC flip committed successfully!\n");
+                    printf("minui: first atomic EPDC flip committed successfully (ret=0, NONBLOCK)!\n");
                     s_first_flip = false;
                 }
             } else {
