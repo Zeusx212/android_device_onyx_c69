@@ -252,6 +252,26 @@ static drmModeCrtc *find_crtc_for_connector(int fd, drmModeRes *resources, drmMo
     drmModeEncoder *encoder;
     int32_t crtc = -1;
 
+    /* Device-specific mapping for Onyx Boox C69HD (Qualcomm SM6225 Bengal):
+     * Connector 29 (DSI-1) -> EPDC CRTC 75
+     * Connector 46 (DSI-2) -> Continuous splash CRTC 112
+     */
+    if (connector->connector_id == 29) {
+        for (j = 0; j < resources->count_crtcs; j++) {
+            if (resources->crtcs[j] == 75) {
+                printf("minui: connector 29 mapped to EPDC CRTC 75\n");
+                return drmModeGetCrtc(fd, 75);
+            }
+        }
+    } else if (connector->connector_id == 46) {
+        for (j = 0; j < resources->count_crtcs; j++) {
+            if (resources->crtcs[j] == 112) {
+                printf("minui: connector 46 mapped to continuous splash CRTC 112\n");
+                return drmModeGetCrtc(fd, 112);
+            }
+        }
+    }
+
     if (connector->encoder_id)
         encoder = drmModeGetEncoder(fd, connector->encoder_id);
     else
@@ -385,41 +405,76 @@ static drmModeConnector *find_main_monitor(int fd, drmModeRes *resources, uint32
 }
 
 /*
- * Disable non-main CRTCs matching stock librecovery_ui.so MinuiBackendDrm::DisableNonMainCrtcs.
- * Only sets ACTIVE = 0 on non-main CRTCs (e.g. CRTC 112) with DRM_MODE_ATOMIC_NONBLOCK.
- * Does NOT forcibly detach connectors or planes, allowing the Qualcomm SDE hardware to cleanly
- * transition away from the continuous splash pipeline without SMMU faults.
+ * Disable non-main CRTCs (e.g. CRTC 112) and secondary connectors (Connector 46 / DSI-2).
+ * On Onyx Boox C69HD, the bootloader initializes continuous splash on CRTC 112 / Connector 46.
+ * When TWRP activates CRTC 75 / Connector 29 (the EPDC command-mode interface), the Qualcomm
+ * kernel unmaps the continuous splash region (0x5c000000). If CRTC 112 remains active, the
+ * MDP hardware DMA engine triggers an unmapped page SMMU fault every vertical refresh,
+ * jamming the MDP scanout and preventing EPDC hardware scanout from completing.
+ * Setting ACTIVE=0 on CRTC 112 with DRM_MODE_ATOMIC_ALLOW_MODESET cleanly stops the continuous
+ * splash hardware pipe and eliminates the SMMU fault.
  */
 static void disable_non_main_crtcs(int fd, drmModeRes *resources, drmModeCrtc *main_crtc) {
     drmModeAtomicReq *req = drmModeAtomicAlloc();
     if (!req) return;
 
-    for (int i = 0; i < resources->count_connectors; i++) {
-        drmModeConnector *conn = drmModeGetConnector(fd, resources->connectors[i]);
-        if (!conn) continue;
-        drmModeCrtc *crtc = find_crtc_for_connector(fd, resources, conn);
-        if (crtc) {
-            if (crtc->crtc_id != main_crtc->crtc_id) {
-                drmModeObjectProperties *props = drmModeObjectGetProperties(fd, crtc->crtc_id, DRM_MODE_OBJECT_CRTC);
-                if (props) {
-                    for (uint32_t j = 0; j < props->count_props; j++) {
-                        drmModePropertyRes *pr = drmModeGetProperty(fd, props->props[j]);
-                        if (!pr) continue;
-                        if (!strcmp(pr->name, "ACTIVE")) {
-                            drmModeAtomicAddProperty(req, crtc->crtc_id, pr->prop_id, 0);
-                        }
-                        drmModeFreeProperty(pr);
+    int crtcs_to_disable = 0;
+
+    /* 1. Set ACTIVE = 0 on all non-main CRTCs (e.g. CRTC 112) */
+    for (int i = 0; i < resources->count_crtcs; i++) {
+        uint32_t crtc_id = resources->crtcs[i];
+        if (crtc_id != main_crtc->crtc_id) {
+            drmModeObjectProperties *props = drmModeObjectGetProperties(fd, crtc_id, DRM_MODE_OBJECT_CRTC);
+            if (props) {
+                for (uint32_t j = 0; j < props->count_props; j++) {
+                    drmModePropertyRes *pr = drmModeGetProperty(fd, props->props[j]);
+                    if (!pr) continue;
+                    if (!strcmp(pr->name, "ACTIVE")) {
+                        int add_ret = drmModeAtomicAddProperty(req, crtc_id, pr->prop_id, 0);
+                        printf("minui: set ACTIVE=0 on non-main CRTC %u (prop_id=%u, ret=%d)\n",
+                               crtc_id, pr->prop_id, add_ret);
+                        crtcs_to_disable++;
                     }
-                    drmModeFreeObjectProperties(props);
+                    drmModeFreeProperty(pr);
                 }
+                drmModeFreeObjectProperties(props);
             }
-            drmModeFreeCrtc(crtc);
         }
-        drmModeFreeConnector(conn);
     }
 
-    int ret = drmModeAtomicCommit(fd, req, DRM_MODE_ATOMIC_NONBLOCK, NULL);
-    printf("minui: disable non-main crtcs atomic commit returned %d\n", ret);
+    /* 2. Disconnect any non-main connectors (e.g. Connector 46 / DSI-2) */
+    for (int i = 0; i < resources->count_connectors; i++) {
+        uint32_t conn_id = resources->connectors[i];
+        if (main_monitor_connector && conn_id != main_monitor_connector->connector_id) {
+            drmModeObjectProperties *props = drmModeObjectGetProperties(fd, conn_id, DRM_MODE_OBJECT_CONNECTOR);
+            if (props) {
+                for (uint32_t j = 0; j < props->count_props; j++) {
+                    drmModePropertyRes *pr = drmModeGetProperty(fd, props->props[j]);
+                    if (!pr) continue;
+                    if (!strcmp(pr->name, "CRTC_ID")) {
+                        int add_ret = drmModeAtomicAddProperty(req, conn_id, pr->prop_id, 0);
+                        printf("minui: set CRTC_ID=0 on non-main connector %u (prop_id=%u, ret=%d)\n",
+                               conn_id, pr->prop_id, add_ret);
+                    }
+                    drmModeFreeProperty(pr);
+                }
+                drmModeFreeObjectProperties(props);
+            }
+        }
+    }
+
+    if (crtcs_to_disable > 0) {
+        int ret = drmModeAtomicCommit(fd, req, DRM_MODE_ATOMIC_ALLOW_MODESET, NULL);
+        printf("minui: disable non-main crtcs atomic commit returned %d\n", ret);
+        if (ret != 0) {
+            /* Fallback retry with NONBLOCK | ALLOW_MODESET */
+            ret = drmModeAtomicCommit(fd, req, DRM_MODE_ATOMIC_ALLOW_MODESET | DRM_MODE_ATOMIC_NONBLOCK, NULL);
+            printf("minui: fallback disable non-main crtcs returned %d\n", ret);
+        }
+    } else {
+        printf("minui: no non-main CRTCs found to disable\n");
+    }
+
     drmModeAtomicFree(req);
 }
 
