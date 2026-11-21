@@ -384,77 +384,42 @@ static drmModeConnector *find_main_monitor(int fd, drmModeRes *resources, uint32
     return main_monitor;
 }
 
-static void teardown_non_main_pipeline(int fd, drmModeRes *resources, drmModeCrtc *main_crtc, uint32_t main_conn_id, uint32_t main_plane_id) {
+/*
+ * Disable non-main CRTCs matching stock librecovery_ui.so MinuiBackendDrm::DisableNonMainCrtcs.
+ * Only sets ACTIVE = 0 on non-main CRTCs (e.g. CRTC 112) with DRM_MODE_ATOMIC_NONBLOCK.
+ * Does NOT forcibly detach connectors or planes, allowing the Qualcomm SDE hardware to cleanly
+ * transition away from the continuous splash pipeline without SMMU faults.
+ */
+static void disable_non_main_crtcs(int fd, drmModeRes *resources, drmModeCrtc *main_crtc) {
     drmModeAtomicReq *req = drmModeAtomicAlloc();
     if (!req) return;
 
-    /* 1. Disable all other connectors */
     for (int i = 0; i < resources->count_connectors; i++) {
-        uint32_t conn_id = resources->connectors[i];
-        if (conn_id != main_conn_id) {
-            drmModeObjectProperties *props = drmModeObjectGetProperties(fd, conn_id, DRM_MODE_OBJECT_CONNECTOR);
-            if (props) {
-                for (uint32_t j = 0; j < props->count_props; j++) {
-                    drmModePropertyRes *pr = drmModeGetProperty(fd, props->props[j]);
-                    if (!pr) continue;
-                    if (!strcmp(pr->name, "CRTC_ID")) {
-                        drmModeAtomicAddProperty(req, conn_id, pr->prop_id, 0);
-                    }
-                    drmModeFreeProperty(pr);
-                }
-                drmModeFreeObjectProperties(props);
-            }
-        }
-    }
-
-    /* 2. Disable all other CRTCs */
-    for (int i = 0; i < resources->count_crtcs; i++) {
-        uint32_t crtc_id = resources->crtcs[i];
-        if (crtc_id != main_crtc->crtc_id) {
-            drmModeObjectProperties *props = drmModeObjectGetProperties(fd, crtc_id, DRM_MODE_OBJECT_CRTC);
-            if (props) {
-                for (uint32_t j = 0; j < props->count_props; j++) {
-                    drmModePropertyRes *pr = drmModeGetProperty(fd, props->props[j]);
-                    if (!pr) continue;
-                    if (!strcmp(pr->name, "ACTIVE")) {
-                        drmModeAtomicAddProperty(req, crtc_id, pr->prop_id, 0);
-                    } else if (!strcmp(pr->name, "MODE_ID")) {
-                        drmModeAtomicAddProperty(req, crtc_id, pr->prop_id, 0);
-                    }
-                    drmModeFreeProperty(pr);
-                }
-                drmModeFreeObjectProperties(props);
-            }
-        }
-    }
-
-    /* 3. Detach all planes other than main_plane_id (clears continuous splash plane 49, etc.) */
-    drmModePlaneRes *plane_res = drmModeGetPlaneResources(fd);
-    if (plane_res) {
-        for (uint32_t i = 0; i < plane_res->count_planes; i++) {
-            uint32_t p_id = plane_res->planes[i];
-            if (p_id != main_plane_id) {
-                drmModeObjectProperties *props = drmModeObjectGetProperties(fd, p_id, DRM_MODE_OBJECT_PLANE);
+        drmModeConnector *conn = drmModeGetConnector(fd, resources->connectors[i]);
+        if (!conn) continue;
+        drmModeCrtc *crtc = find_crtc_for_connector(fd, resources, conn);
+        if (crtc) {
+            if (crtc->crtc_id != main_crtc->crtc_id) {
+                drmModeObjectProperties *props = drmModeObjectGetProperties(fd, crtc->crtc_id, DRM_MODE_OBJECT_CRTC);
                 if (props) {
                     for (uint32_t j = 0; j < props->count_props; j++) {
                         drmModePropertyRes *pr = drmModeGetProperty(fd, props->props[j]);
                         if (!pr) continue;
-                        if (!strcmp(pr->name, "CRTC_ID")) {
-                            drmModeAtomicAddProperty(req, p_id, pr->prop_id, 0);
-                        } else if (!strcmp(pr->name, "FB_ID")) {
-                            drmModeAtomicAddProperty(req, p_id, pr->prop_id, 0);
+                        if (!strcmp(pr->name, "ACTIVE")) {
+                            drmModeAtomicAddProperty(req, crtc->crtc_id, pr->prop_id, 0);
                         }
                         drmModeFreeProperty(pr);
                     }
                     drmModeFreeObjectProperties(props);
                 }
             }
+            drmModeFreeCrtc(crtc);
         }
-        drmModeFreePlaneResources(plane_res);
+        drmModeFreeConnector(conn);
     }
 
-    int ret = drmModeAtomicCommit(fd, req, DRM_MODE_ATOMIC_ALLOW_MODESET, NULL);
-    printf("minui: teardown non-main pipeline atomic commit returned %d\n", ret);
+    int ret = drmModeAtomicCommit(fd, req, DRM_MODE_ATOMIC_NONBLOCK, NULL);
+    printf("minui: disable non-main crtcs atomic commit returned %d\n", ret);
     drmModeAtomicFree(req);
 }
 
@@ -679,8 +644,8 @@ static GRSurface* drm_init(minui_backend* backend __unused) {
     /* Initialize Atomic Properties & discover primary EPDC plane (g_plane_id) */
     init_atomic_properties(drm_fd, main_monitor_crtc, main_monitor_connector);
 
-    /* Teardown non-main pipeline (disable secondary CRTCs/connectors & detach Plane 49) */
-    teardown_non_main_pipeline(drm_fd, res, main_monitor_crtc, main_monitor_connector->connector_id, g_plane_id);
+    /* Disable non-main CRTCs (e.g. CRTC 112) matching stock librecovery_ui.so */
+    disable_non_main_crtcs(drm_fd, res, main_monitor_crtc);
 
     drmModeFreeResources(res);
 
@@ -719,31 +684,6 @@ static GRSurface* drm_init(minui_backend* backend __unused) {
     if (g_has_atomic) {
         drmModeAtomicReq *req = drmModeAtomicAlloc();
         if (req) {
-            /* Detach all other planes (continuous splash plane 49, etc.) in this modeset commit */
-            drmModePlaneRes *pres = drmModeGetPlaneResources(drm_fd);
-            if (pres) {
-                for (uint32_t i = 0; i < pres->count_planes; i++) {
-                    uint32_t pid = pres->planes[i];
-                    if (pid != g_plane_id) {
-                        drmModeObjectProperties *props = drmModeObjectGetProperties(drm_fd, pid, DRM_MODE_OBJECT_PLANE);
-                        if (props) {
-                            for (uint32_t j = 0; j < props->count_props; j++) {
-                                drmModePropertyRes *pr = drmModeGetProperty(drm_fd, props->props[j]);
-                                if (!pr) continue;
-                                if (!strcmp(pr->name, "CRTC_ID")) {
-                                    drmModeAtomicAddProperty(req, pid, pr->prop_id, 0);
-                                } else if (!strcmp(pr->name, "FB_ID")) {
-                                    drmModeAtomicAddProperty(req, pid, pr->prop_id, 0);
-                                }
-                                drmModeFreeProperty(pr);
-                            }
-                            drmModeFreeObjectProperties(props);
-                        }
-                    }
-                }
-                drmModeFreePlaneResources(pres);
-            }
-
             if (prop_crtc_active)
                 drmModeAtomicAddProperty(req, main_monitor_crtc->crtc_id, prop_crtc_active, 1);
             if (prop_crtc_mode_id && g_mode_blob_id)
