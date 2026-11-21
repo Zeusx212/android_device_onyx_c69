@@ -9,6 +9,8 @@ jobs:
   build:
     name: Compile TWRP 11.0
     runs-on: ubuntu-22.04
+    permissions:
+      contents: write
 
     steps:
       - name: Checkout Device Tree
@@ -73,3 +75,15 @@ jobs:
           name: twrp-c69-recovery
           path: twrp/out/target/product/c69/recovery.img
           if-no-files-found: error
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: "TWRP 11.0 for Onyx Boox C69HD (Touch & EPDC E-Ink)"
+          draft: false
+          prerelease: false
+          files: twrp/out/target/product/c69/recovery.img
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

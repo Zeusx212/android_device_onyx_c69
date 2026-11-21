@@ -1,5 +1,7 @@
 /*
  * Copyright (C) 2015 The Android Open Source Project
+ * Copyright (C) 2026 TeamWin Recovery Project
+ * Copyright (C) 2026 Zeusx212 & 7sarus
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,6 +19,7 @@
 #include <drm_fourcc.h>
 #include <fcntl.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -34,6 +37,24 @@
 
 #define ARRAY_SIZE(A) (sizeof(A)/sizeof(*(A)))
 
+/*
+ * Qualcomm MDSS / SDE Electrophoretic Display Controller (EPDC) Update Parameters.
+ * Recovered from Qualcomm Linux 4.19 kernel driver (sde_plane.c / onyx_epdc).
+ * Total size: 8 * 40 bytes = 320 bytes.
+ */
+struct epdc_update_params {
+    int32_t rect[4];        /* +0x00: { x, y, width, height } */
+    int32_t waveform_mode;  /* +0x10: 2 = GC16 (full quality), 1 = DU, 12 = A2 */
+    int32_t update_mode;    /* +0x14: 0 = normal full update */
+    int32_t update_marker;  /* +0x18: monotonically increasing submission counter */
+    int32_t temp;           /* +0x1c: ambient temperature index (0 = default/auto) */
+    int32_t flag;           /* +0x20: 0x21000 accepted by Qualcomm EPDC driver */
+    int32_t reserved;       /* +0x24: reserved / padding */
+};
+
+static struct epdc_update_params g_epdc_parms[8];
+static uint32_t g_update_marker = 0;
+
 struct drm_surface {
     GRSurface base;
     uint32_t fb_id;
@@ -41,17 +62,44 @@ struct drm_surface {
 };
 
 static drm_surface *drm_surfaces[2];
-static int current_buffer;
+static int current_buffer = 0;
 static GRSurface *draw_buf = NULL;
 
-static drmModeCrtc *main_monitor_crtc;
-static drmModeConnector *main_monitor_connector;
+static drmModeCrtc *main_monitor_crtc = NULL;
+static drmModeConnector *main_monitor_connector = NULL;
 
 static int drm_fd = -1;
+static int screen_width = 0;
+static int screen_height = 0;
 
-static void drm_disable_crtc(int drm_fd, drmModeCrtc *crtc) {
+/* Atomic DRM Plane Properties */
+static uint32_t g_plane_id = 0;
+static uint32_t prop_plane_fb_id = 0;
+static uint32_t prop_plane_crtc_id = 0;
+static uint32_t prop_plane_crtc_x = 0;
+static uint32_t prop_plane_crtc_y = 0;
+static uint32_t prop_plane_crtc_w = 0;
+static uint32_t prop_plane_crtc_h = 0;
+static uint32_t prop_plane_src_x = 0;
+static uint32_t prop_plane_src_y = 0;
+static uint32_t prop_plane_src_w = 0;
+static uint32_t prop_plane_src_h = 0;
+static uint32_t prop_epdc_parms_addr = 0;
+static uint32_t prop_epdc_cnt = 0;
+
+/* Atomic DRM CRTC Properties */
+static uint32_t prop_crtc_active = 0;
+static uint32_t prop_crtc_mode_id = 0;
+static uint32_t g_mode_blob_id = 0;
+
+/* Atomic DRM Connector Properties */
+static uint32_t prop_conn_crtc_id = 0;
+
+static bool g_has_atomic = false;
+
+static void drm_disable_crtc(int fd, drmModeCrtc *crtc) {
     if (crtc) {
-        drmModeSetCrtc(drm_fd, crtc->crtc_id,
+        drmModeSetCrtc(fd, crtc->crtc_id,
                        0, // fb_id
                        0, 0,  // x,y
                        NULL,  // connectors
@@ -60,60 +108,49 @@ static void drm_disable_crtc(int drm_fd, drmModeCrtc *crtc) {
     }
 }
 
-static void drm_enable_crtc(int drm_fd, drmModeCrtc *crtc,
-                            struct drm_surface *surface) {
-    int32_t ret;
+static void drm_enable_crtc(int fd, drmModeCrtc *crtc, struct drm_surface *surface) {
+    if (!crtc || !surface || !main_monitor_connector)
+        return;
 
-    ret = drmModeSetCrtc(drm_fd, crtc->crtc_id,
-                         surface->fb_id,
-                         0, 0,  // x,y
-                         &main_monitor_connector->connector_id,
-                         1,  // connector_count
-                         &main_monitor_crtc->mode);
-
+    int32_t ret = drmModeSetCrtc(fd, crtc->crtc_id,
+                                surface->fb_id,
+                                0, 0,
+                                &main_monitor_connector->connector_id,
+                                1,
+                                &main_monitor_crtc->mode);
     if (ret)
-        printf("drmModeSetCrtc failed ret=%d\n", ret);
-}
-
-static void drm_blank(minui_backend* backend __unused, bool blank) {
-    if (blank)
-        drm_disable_crtc(drm_fd, main_monitor_crtc);
-    else
-        drm_enable_crtc(drm_fd, main_monitor_crtc,
-                        drm_surfaces[current_buffer]);
+        printf("minui: drmModeSetCrtc failed ret=%d\n", ret);
 }
 
 static void drm_destroy_surface(struct drm_surface *surface) {
     struct drm_gem_close gem_close;
     int ret;
 
-    if(!surface)
+    if (!surface)
         return;
 
     if (surface->base.data)
-        munmap(surface->base.data,
-               surface->base.row_bytes * surface->base.height);
+        munmap(surface->base.data, surface->base.row_bytes * surface->base.height);
 
     if (surface->fb_id) {
         ret = drmModeRmFB(drm_fd, surface->fb_id);
         if (ret)
-            printf("drmModeRmFB failed ret=%d\n", ret);
+            printf("minui: drmModeRmFB failed ret=%d\n", ret);
     }
 
     if (surface->handle) {
         memset(&gem_close, 0, sizeof(gem_close));
         gem_close.handle = surface->handle;
-
         ret = drmIoctl(drm_fd, DRM_IOCTL_GEM_CLOSE, &gem_close);
         if (ret)
-            printf("DRM_IOCTL_GEM_CLOSE failed ret=%d\n", ret);
+            printf("minui: DRM_IOCTL_GEM_CLOSE failed ret=%d\n", ret);
     }
 
     free(surface);
 }
 
 static int drm_format_to_bpp(uint32_t format) {
-    switch(format) {
+    switch (format) {
         case DRM_FORMAT_ABGR8888:
         case DRM_FORMAT_BGRA8888:
         case DRM_FORMAT_RGBX8888:
@@ -121,11 +158,12 @@ static int drm_format_to_bpp(uint32_t format) {
         case DRM_FORMAT_XBGR8888:
         case DRM_FORMAT_ARGB8888:
         case DRM_FORMAT_XRGB8888:
+        case DRM_FORMAT_RGBA8888:
             return 32;
         case DRM_FORMAT_RGB565:
             return 16;
         default:
-            printf("Unknown format %d\n", format);
+            printf("minui: Unknown format %d, defaulting to 32bpp\n", format);
             return 32;
     }
 }
@@ -139,30 +177,25 @@ static drm_surface *drm_create_surface(int width, int height) {
 
     surface = (struct drm_surface*)calloc(1, sizeof(*surface));
     if (!surface) {
-        printf("Can't allocate memory\n");
+        printf("minui: Can't allocate surface memory\n");
         return NULL;
     }
 
 #if defined(RECOVERY_ABGR)
     format = DRM_FORMAT_RGBA8888;
     base_format = GGL_PIXEL_FORMAT_RGBA_8888;
-    printf("setting DRM_FORMAT_RGBA8888 and GGL_PIXEL_FORMAT_RGBA_8888\n");
 #elif defined(RECOVERY_BGRA)
     format = DRM_FORMAT_ARGB8888;
     base_format = GGL_PIXEL_FORMAT_RGBA_8888;
-    printf("setting DRM_FORMAT_ARGB8888 and GGL_PIXEL_FORMAT_RGBA_8888\n");
 #elif defined(RECOVERY_RGBA)
     format = DRM_FORMAT_ABGR8888;
     base_format = GGL_PIXEL_FORMAT_BGRA_8888;
-    printf("setting DRM_FORMAT_ABGR8888 and GGL_PIXEL_FORMAT_BGRA_8888, GGL_PIXEL_FORMAT may not match!\n");
 #elif defined(RECOVERY_RGBX)
     format = DRM_FORMAT_XBGR8888;
     base_format = GGL_PIXEL_FORMAT_RGBA_8888;
-    printf("setting DRM_FORMAT_XBGR8888 and GGL_PIXEL_FORMAT_RGBA_8888\n");
 #else
-    format = DRM_FORMAT_RGB565;
-    base_format = GGL_PIXEL_FORMAT_BGRA_8888;
-    printf("setting DRM_FORMAT_RGB565 and GGL_PIXEL_FORMAT_RGB_565\n");
+    format = DRM_FORMAT_RGBA8888;
+    base_format = GGL_PIXEL_FORMAT_RGBA_8888;
 #endif
 
     memset(&create_dumb, 0, sizeof(create_dumb));
@@ -173,23 +206,19 @@ static drm_surface *drm_create_surface(int width, int height) {
 
     ret = drmIoctl(drm_fd, DRM_IOCTL_MODE_CREATE_DUMB, &create_dumb);
     if (ret) {
-        printf("DRM_IOCTL_MODE_CREATE_DUMB failed ret=%d\n",ret);
+        printf("minui: DRM_IOCTL_MODE_CREATE_DUMB failed ret=%d\n", ret);
         drm_destroy_surface(surface);
         return NULL;
     }
     surface->handle = create_dumb.handle;
 
-    uint32_t handles[4], pitches[4], offsets[4];
+    uint32_t handles[4] = { surface->handle, 0, 0, 0 };
+    uint32_t pitches[4] = { create_dumb.pitch, 0, 0, 0 };
+    uint32_t offsets[4] = { 0, 0, 0, 0 };
 
-    handles[0] = surface->handle;
-    pitches[0] = create_dumb.pitch;
-    offsets[0] = 0;
-
-    ret = drmModeAddFB2(drm_fd, width, height,
-            format, handles, pitches, offsets,
-            &(surface->fb_id), 0);
+    ret = drmModeAddFB2(drm_fd, width, height, format, handles, pitches, offsets, &(surface->fb_id), 0);
     if (ret) {
-        printf("drmModeAddFB2 failed ret=%d\n", ret);
+        printf("minui: drmModeAddFB2 failed ret=%d\n", ret);
         drm_destroy_surface(surface);
         return NULL;
     }
@@ -199,9 +228,9 @@ static drm_surface *drm_create_surface(int width, int height) {
     map_dumb.handle = create_dumb.handle;
     ret = drmIoctl(drm_fd, DRM_IOCTL_MODE_MAP_DUMB, &map_dumb);
     if (ret) {
-        printf("DRM_IOCTL_MODE_MAP_DUMB failed ret=%d\n",ret);
+        printf("minui: DRM_IOCTL_MODE_MAP_DUMB failed ret=%d\n", ret);
         drm_destroy_surface(surface);
-        return NULL;;
+        return NULL;
     }
 
     surface->base.height = height;
@@ -209,13 +238,14 @@ static drm_surface *drm_create_surface(int width, int height) {
     surface->base.row_bytes = create_dumb.pitch;
     surface->base.pixel_bytes = create_dumb.bpp / 8;
     surface->base.format = base_format;
-    surface->base.data = (unsigned char*)
-                         mmap(NULL,
-                              surface->base.height * surface->base.row_bytes,
-                              PROT_READ | PROT_WRITE, MAP_SHARED,
-                              drm_fd, map_dumb.offset);
+    surface->base.data = (unsigned char*)mmap(NULL,
+                                              surface->base.height * surface->base.row_bytes,
+                                              PROT_READ | PROT_WRITE,
+                                              MAP_SHARED,
+                                              drm_fd,
+                                              map_dumb.offset);
     if (surface->base.data == MAP_FAILED) {
-        perror("mmap() failed");
+        perror("minui: mmap() failed");
         drm_destroy_surface(surface);
         return NULL;
     }
@@ -223,16 +253,11 @@ static drm_surface *drm_create_surface(int width, int height) {
     return surface;
 }
 
-static drmModeCrtc *find_crtc_for_connector(int fd,
-                            drmModeRes *resources,
-                            drmModeConnector *connector) {
+static drmModeCrtc *find_crtc_for_connector(int fd, drmModeRes *resources, drmModeConnector *connector) {
     int i, j;
     drmModeEncoder *encoder;
-    int32_t crtc;
+    int32_t crtc = -1;
 
-    /*
-     * Find the encoder. If we already have one, just use it.
-     */
     if (connector->encoder_id)
         encoder = drmModeGetEncoder(fd, connector->encoder_id);
     else
@@ -244,18 +269,16 @@ static drmModeCrtc *find_crtc_for_connector(int fd,
         return drmModeGetCrtc(fd, crtc);
     }
 
-    /*
-     * Didn't find anything, try to find a crtc and encoder combo.
-     * Prefer primary E-Ink panel CRTC (ID 75 on Qualcomm Bengal/Scuba DSI-1, 1024x758).
-     */
-    crtc = -1;
+    if (encoder)
+        drmModeFreeEncoder(encoder);
+
     for (i = 0; i < connector->count_encoders; i++) {
         encoder = drmModeGetEncoder(fd, connector->encoders[i]);
-
         if (encoder) {
             for (j = 0; j < resources->count_crtcs; j++) {
                 if (!(encoder->possible_crtcs & (1 << j)))
                     continue;
+                /* Prefer primary EPDC display CRTC (ID 75 on Qualcomm Bengal) */
                 if (resources->crtcs[j] == 75) {
                     crtc = resources->crtcs[j];
                     break;
@@ -264,29 +287,24 @@ static drmModeCrtc *find_crtc_for_connector(int fd,
                     crtc = resources->crtcs[j];
                 }
             }
-            if (crtc >= 0) {
-                drmModeFreeEncoder(encoder);
+            drmModeFreeEncoder(encoder);
+            if (crtc >= 0)
                 return drmModeGetCrtc(fd, crtc);
-            }
         }
     }
 
     return NULL;
 }
 
-static drmModeConnector *find_used_connector_by_type(int fd,
-                                 drmModeRes *resources,
-                                 unsigned type) {
+static drmModeConnector *find_used_connector_by_type(int fd, drmModeRes *resources, unsigned type) {
     int i;
     for (i = 0; i < resources->count_connectors; i++) {
-        drmModeConnector *connector;
-
-        connector = drmModeGetConnector(fd, resources->connectors[i]);
+        drmModeConnector *connector = drmModeGetConnector(fd, resources->connectors[i]);
         if (connector) {
             if ((connector->connector_type == type) &&
-                    (connector->connection == DRM_MODE_CONNECTED) &&
-                    (connector->count_modes > 0)) {
-                // Skip Qualcomm dummy video panels (e.g. 301x769 dummy panel)
+                (connector->connection == DRM_MODE_CONNECTED) &&
+                (connector->count_modes > 0)) {
+                /* Skip Qualcomm dummy/stale video panels (e.g. 301x769) */
                 if (type == DRM_MODE_CONNECTOR_DSI && connector->count_modes > 0) {
                     if (connector->modes[0].hdisplay == 301 && connector->modes[0].vdisplay == 769) {
                         printf("minui: skipping dummy video connector %d (301x769)\n", connector->connector_id);
@@ -296,23 +314,18 @@ static drmModeConnector *find_used_connector_by_type(int fd,
                 }
                 return connector;
             }
-
             drmModeFreeConnector(connector);
         }
     }
     return NULL;
 }
 
-static drmModeConnector *find_first_connected_connector(int fd,
-                             drmModeRes *resources) {
+static drmModeConnector *find_first_connected_connector(int fd, drmModeRes *resources) {
     int i;
     for (i = 0; i < resources->count_connectors; i++) {
-        drmModeConnector *connector;
-
-        connector = drmModeGetConnector(fd, resources->connectors[i]);
+        drmModeConnector *connector = drmModeGetConnector(fd, resources->connectors[i]);
         if (connector) {
-            if ((connector->count_modes > 0) &&
-                    (connector->connection == DRM_MODE_CONNECTED)) {
+            if ((connector->count_modes > 0) && (connector->connection == DRM_MODE_CONNECTED)) {
                 if (connector->modes[0].hdisplay == 301 && connector->modes[0].vdisplay == 769) {
                     printf("minui: skipping dummy video connector %d (301x769)\n", connector->connector_id);
                     drmModeFreeConnector(connector);
@@ -320,67 +333,52 @@ static drmModeConnector *find_first_connected_connector(int fd,
                 }
                 return connector;
             }
-
             drmModeFreeConnector(connector);
         }
     }
     return NULL;
 }
 
-static drmModeConnector *find_main_monitor(int fd, drmModeRes *resources,
-        uint32_t *mode_index) {
+static drmModeConnector *find_main_monitor(int fd, drmModeRes *resources, uint32_t *mode_index) {
     unsigned i = 0;
     int modes;
-    /* Look for LVDS/eDP/DSI connectors. Those are the main screens. */
     unsigned kConnectorPriority[] = {
-        DRM_MODE_CONNECTOR_LVDS,
-        DRM_MODE_CONNECTOR_eDP,
         DRM_MODE_CONNECTOR_DSI,
+        DRM_MODE_CONNECTOR_eDP,
+        DRM_MODE_CONNECTOR_LVDS,
     };
 
-    drmModeConnector *main_monitor_connector = NULL;
+    drmModeConnector *main_monitor = NULL;
     do {
-        main_monitor_connector = find_used_connector_by_type(fd,
-                                         resources,
-                                         kConnectorPriority[i]);
+        main_monitor = find_used_connector_by_type(fd, resources, kConnectorPriority[i]);
         i++;
-    } while (!main_monitor_connector && i < ARRAY_SIZE(kConnectorPriority));
+    } while (!main_monitor && i < ARRAY_SIZE(kConnectorPriority));
 
-    /* If we didn't find a connector, grab the first one that is connected. */
-    if (!main_monitor_connector)
-        main_monitor_connector =
-                find_first_connected_connector(fd, resources);
+    if (!main_monitor)
+        main_monitor = find_first_connected_connector(fd, resources);
 
-    /* If we still didn't find a connector, give up and return. */
-    if (!main_monitor_connector)
+    if (!main_monitor)
         return NULL;
 
     *mode_index = 0;
-    for (modes = 0; modes < main_monitor_connector->count_modes; modes++) {
-        if (main_monitor_connector->modes[modes].type &
-                DRM_MODE_TYPE_PREFERRED) {
+    for (modes = 0; modes < main_monitor->count_modes; modes++) {
+        if (main_monitor->modes[modes].type & DRM_MODE_TYPE_PREFERRED) {
             *mode_index = modes;
             break;
         }
     }
 
-    return main_monitor_connector;
+    return main_monitor;
 }
 
-static void disable_non_main_crtcs(int fd,
-                    drmModeRes *resources,
-                    drmModeCrtc* main_crtc) {
+static void disable_non_main_crtcs(int fd, drmModeRes *resources, drmModeCrtc *main_crtc) {
     int i;
-    drmModeCrtc* crtc;
-
     for (i = 0; i < resources->count_connectors; i++) {
-        drmModeConnector *connector;
-
-        connector = drmModeGetConnector(fd, resources->connectors[i]);
+        drmModeConnector *connector = drmModeGetConnector(fd, resources->connectors[i]);
         if (!connector)
             continue;
 
-        crtc = find_crtc_for_connector(fd, resources, connector);
+        drmModeCrtc *crtc = find_crtc_for_connector(fd, resources, connector);
         if (crtc) {
             if (crtc->crtc_id != main_crtc->crtc_id)
                 drm_disable_crtc(fd, crtc);
@@ -390,27 +388,150 @@ static void disable_non_main_crtcs(int fd,
     }
 }
 
+/*
+ * Discover and cache Qualcomm Atomic DRM Plane, CRTC, and EPDC properties.
+ */
+static void init_atomic_properties(int fd, drmModeCrtc *crtc, drmModeConnector *conn) {
+    drmModePlaneRes *plane_res = drmModeGetPlaneResources(fd);
+    if (!plane_res) {
+        printf("minui: drmModeGetPlaneResources returned NULL; atomic disabled\n");
+        return;
+    }
+
+    uint32_t crtc_mask = 0;
+    drmModeRes *res = drmModeGetResources(fd);
+    if (res) {
+        for (int i = 0; i < res->count_crtcs; i++) {
+            if (res->crtcs[i] == crtc->crtc_id) {
+                crtc_mask = (1 << i);
+                break;
+            }
+        }
+        drmModeFreeResources(res);
+    }
+
+    /* Find matching primary plane for this CRTC */
+    for (uint32_t i = 0; i < plane_res->count_planes; i++) {
+        drmModePlane *plane = drmModeGetPlane(fd, plane_res->planes[i]);
+        if (!plane) continue;
+
+        if (crtc_mask && !(plane->possible_crtcs & crtc_mask)) {
+            drmModeFreePlane(plane);
+            continue;
+        }
+
+        g_plane_id = plane->plane_id;
+        drmModeObjectProperties *props = drmModeObjectGetProperties(fd, g_plane_id, DRM_MODE_OBJECT_PLANE);
+        if (props) {
+            for (uint32_t j = 0; j < props->count_props; j++) {
+                drmModePropertyRes *pr = drmModeGetProperty(fd, props->props[j]);
+                if (!pr) continue;
+
+                if (!strcmp(pr->name, "FB_ID"))
+                    prop_plane_fb_id = pr->prop_id;
+                else if (!strcmp(pr->name, "CRTC_ID"))
+                    prop_plane_crtc_id = pr->prop_id;
+                else if (!strcmp(pr->name, "CRTC_X"))
+                    prop_plane_crtc_x = pr->prop_id;
+                else if (!strcmp(pr->name, "CRTC_Y"))
+                    prop_plane_crtc_y = pr->prop_id;
+                else if (!strcmp(pr->name, "CRTC_W"))
+                    prop_plane_crtc_w = pr->prop_id;
+                else if (!strcmp(pr->name, "CRTC_H"))
+                    prop_plane_crtc_h = pr->prop_id;
+                else if (!strcmp(pr->name, "SRC_X"))
+                    prop_plane_src_x = pr->prop_id;
+                else if (!strcmp(pr->name, "SRC_Y"))
+                    prop_plane_src_y = pr->prop_id;
+                else if (!strcmp(pr->name, "SRC_W"))
+                    prop_plane_src_w = pr->prop_id;
+                else if (!strcmp(pr->name, "SRC_H"))
+                    prop_plane_src_h = pr->prop_id;
+                else if (!strcmp(pr->name, "EPDC_UPDATE_PARMS_ADDR"))
+                    prop_epdc_parms_addr = pr->prop_id;
+                else if (!strcmp(pr->name, "EPDC_UPDATE_CNT"))
+                    prop_epdc_cnt = pr->prop_id;
+
+                drmModeFreeProperty(pr);
+            }
+            drmModeFreeObjectProperties(props);
+        }
+
+        drmModeFreePlane(plane);
+
+        /* Stop once we find the EPDC plane or any plane that has FB_ID */
+        if (prop_epdc_parms_addr && prop_epdc_cnt) {
+            printf("minui: Found Qualcomm EPDC Plane %u (PARMS_ADDR=%u, CNT=%u)\n",
+                   g_plane_id, prop_epdc_parms_addr, prop_epdc_cnt);
+            break;
+        }
+    }
+    drmModeFreePlaneResources(plane_res);
+
+    /* Fetch CRTC Properties */
+    drmModeObjectProperties *crtc_props = drmModeObjectGetProperties(fd, crtc->crtc_id, DRM_MODE_OBJECT_CRTC);
+    if (crtc_props) {
+        for (uint32_t j = 0; j < crtc_props->count_props; j++) {
+            drmModePropertyRes *pr = drmModeGetProperty(fd, crtc_props->props[j]);
+            if (!pr) continue;
+            if (!strcmp(pr->name, "ACTIVE"))
+                prop_crtc_active = pr->prop_id;
+            else if (!strcmp(pr->name, "MODE_ID"))
+                prop_crtc_mode_id = pr->prop_id;
+            drmModeFreeProperty(pr);
+        }
+        drmModeFreeObjectProperties(crtc_props);
+    }
+
+    /* Fetch Connector Properties */
+    drmModeObjectProperties *conn_props = drmModeObjectGetProperties(fd, conn->connector_id, DRM_MODE_OBJECT_CONNECTOR);
+    if (conn_props) {
+        for (uint32_t j = 0; j < conn_props->count_props; j++) {
+            drmModePropertyRes *pr = drmModeGetProperty(fd, conn_props->props[j]);
+            if (!pr) continue;
+            if (!strcmp(pr->name, "CRTC_ID"))
+                prop_conn_crtc_id = pr->prop_id;
+            drmModeFreeProperty(pr);
+        }
+        drmModeFreeObjectProperties(conn_props);
+    }
+
+    /* Create mode blob */
+    if (prop_crtc_mode_id) {
+        int ret = drmModeCreatePropertyBlob(fd, &crtc->mode, sizeof(drmModeModeInfo), &g_mode_blob_id);
+        if (ret)
+            printf("minui: drmModeCreatePropertyBlob failed ret=%d\n", ret);
+    }
+
+    if (g_plane_id && prop_plane_fb_id && prop_plane_crtc_id) {
+        g_has_atomic = true;
+        printf("minui: Atomic modeset support initialized successfully.\n");
+    } else {
+        printf("minui: Atomic prerequisites missing (plane=%u, fb_id=%u, crtc_id=%u)\n",
+               g_plane_id, prop_plane_fb_id, prop_plane_crtc_id);
+    }
+}
+
 static GRSurface* drm_init(minui_backend* backend __unused) {
     drmModeRes *res = NULL;
     uint32_t selected_mode;
     char *dev_name;
-    int width, height;
     int ret, i;
 
-    /* Consider DRM devices in order. */
     for (i = 0; i < DRM_MAX_MINOR; i++) {
         uint64_t cap = 0;
 
         ret = asprintf(&dev_name, DRM_DEV_NAME, DRM_DIR_NAME, i);
-        if (ret < 0)
-            continue;
+        if (ret < 0) continue;
 
         drm_fd = open(dev_name, O_RDWR, 0);
         free(dev_name);
-        if (drm_fd < 0)
-            continue;
+        if (drm_fd < 0) continue;
 
-        /* We need dumb buffers. */
+        /* Enable Universal Planes & Atomic capabilities early */
+        drmSetClientCap(drm_fd, DRM_CLIENT_CAP_UNIVERSAL_PLANES, 1);
+        drmSetClientCap(drm_fd, DRM_CLIENT_CAP_ATOMIC, 1);
+
         ret = drmGetCap(drm_fd, DRM_CAP_DUMB_BUFFER, &cap);
         if (ret || cap == 0) {
             close(drm_fd);
@@ -423,7 +544,6 @@ static GRSurface* drm_init(minui_backend* backend __unused) {
             continue;
         }
 
-        /* Use this device if it has at least one connected monitor. */
         if (res->count_crtcs > 0 && res->count_connectors > 0)
             if (find_first_connected_connector(drm_fd, res))
                 break;
@@ -434,42 +554,38 @@ static GRSurface* drm_init(minui_backend* backend __unused) {
     }
 
     if (drm_fd < 0 || res == NULL) {
-        perror("cannot find/open a drm device");
+        perror("minui: cannot find/open a usable drm device");
         return NULL;
     }
 
-    main_monitor_connector = find_main_monitor(drm_fd,
-            res, &selected_mode);
-
+    main_monitor_connector = find_main_monitor(drm_fd, res, &selected_mode);
     if (!main_monitor_connector) {
-        printf("main_monitor_connector not found\n");
+        printf("minui: main_monitor_connector not found\n");
         drmModeFreeResources(res);
         close(drm_fd);
         return NULL;
     }
 
-    main_monitor_crtc = find_crtc_for_connector(drm_fd, res,
-                                                main_monitor_connector);
-
+    main_monitor_crtc = find_crtc_for_connector(drm_fd, res, main_monitor_connector);
     if (!main_monitor_crtc) {
-        printf("main_monitor_crtc not found\n");
+        printf("minui: main_monitor_crtc not found\n");
         drmModeFreeResources(res);
         close(drm_fd);
         return NULL;
     }
 
-    disable_non_main_crtcs(drm_fd,
-                           res, main_monitor_crtc);
-
+    disable_non_main_crtcs(drm_fd, res, main_monitor_crtc);
     main_monitor_crtc->mode = main_monitor_connector->modes[selected_mode];
 
-    width = main_monitor_crtc->mode.hdisplay;
-    height = main_monitor_crtc->mode.vdisplay;
+    screen_width = main_monitor_crtc->mode.hdisplay;
+    screen_height = main_monitor_crtc->mode.vdisplay;
+    printf("minui: Screen resolution detected: %dx%d @ %d Hz\n",
+           screen_width, screen_height, main_monitor_crtc->mode.vrefresh);
 
     drmModeFreeResources(res);
 
-    drm_surfaces[0] = drm_create_surface(width, height);
-    drm_surfaces[1] = drm_create_surface(width, height);
+    drm_surfaces[0] = drm_create_surface(screen_width, screen_height);
+    drm_surfaces[1] = drm_create_surface(screen_width, screen_height);
     if (!drm_surfaces[0] || !drm_surfaces[1]) {
         drm_destroy_surface(drm_surfaces[0]);
         drm_destroy_surface(drm_surfaces[1]);
@@ -479,7 +595,7 @@ static GRSurface* drm_init(minui_backend* backend __unused) {
 
     draw_buf = (GRSurface *)malloc(sizeof(GRSurface));
     if (!draw_buf) {
-        printf("failed to alloc draw_buf\n");
+        printf("minui: failed to alloc draw_buf\n");
         drm_destroy_surface(drm_surfaces[0]);
         drm_destroy_surface(drm_surfaces[1]);
         close(drm_fd);
@@ -489,7 +605,7 @@ static GRSurface* drm_init(minui_backend* backend __unused) {
     memcpy(draw_buf, &drm_surfaces[0]->base, sizeof(GRSurface));
     draw_buf->data = (unsigned char *)calloc(draw_buf->height * draw_buf->row_bytes, 1);
     if (!draw_buf->data) {
-        printf("failed to alloc draw_buf surface\n");
+        printf("minui: failed to alloc draw_buf surface data\n");
         free(draw_buf);
         drm_destroy_surface(drm_surfaces[0]);
         drm_destroy_surface(drm_surfaces[1]);
@@ -499,55 +615,164 @@ static GRSurface* drm_init(minui_backend* backend __unused) {
 
     current_buffer = 0;
 
-    drm_enable_crtc(drm_fd, main_monitor_crtc, drm_surfaces[1]);
+    /* Initialize Atomic Properties & Qualcomm EPDC handles */
+    init_atomic_properties(drm_fd, main_monitor_crtc, main_monitor_connector);
 
-    // Clear splash residue from E-Ink screen on startup
-    int clean_fd = open("/sys/devices/platform/onyx_epdc_fb.0/panel_clean", O_RDONLY);
-    if (clean_fd >= 0) {
-        char clean_buf[16];
-        read(clean_fd, clean_buf, sizeof(clean_buf));
-        close(clean_fd);
+    /* Perform initial modeset */
+    if (g_has_atomic) {
+        drmModeAtomicReq *req = drmModeAtomicAlloc();
+        if (req) {
+            if (prop_crtc_active)
+                drmModeAtomicAddProperty(req, main_monitor_crtc->crtc_id, prop_crtc_active, 1);
+            if (prop_crtc_mode_id && g_mode_blob_id)
+                drmModeAtomicAddProperty(req, main_monitor_crtc->crtc_id, prop_crtc_mode_id, g_mode_blob_id);
+            if (prop_conn_crtc_id)
+                drmModeAtomicAddProperty(req, main_monitor_connector->connector_id, prop_conn_crtc_id, main_monitor_crtc->crtc_id);
+
+            drmModeAtomicAddProperty(req, g_plane_id, prop_plane_fb_id, drm_surfaces[1]->fb_id);
+            drmModeAtomicAddProperty(req, g_plane_id, prop_plane_crtc_id, main_monitor_crtc->crtc_id);
+            if (prop_plane_src_w) drmModeAtomicAddProperty(req, g_plane_id, prop_plane_src_w, ((uint64_t)screen_width) << 16);
+            if (prop_plane_src_h) drmModeAtomicAddProperty(req, g_plane_id, prop_plane_src_h, ((uint64_t)screen_height) << 16);
+            if (prop_plane_crtc_w) drmModeAtomicAddProperty(req, g_plane_id, prop_plane_crtc_w, screen_width);
+            if (prop_plane_crtc_h) drmModeAtomicAddProperty(req, g_plane_id, prop_plane_crtc_h, screen_height);
+
+            if (prop_epdc_parms_addr && prop_epdc_cnt) {
+                memset(g_epdc_parms, 0, sizeof(g_epdc_parms));
+                g_epdc_parms[0].rect[0] = 0;
+                g_epdc_parms[0].rect[1] = 0;
+                g_epdc_parms[0].rect[2] = screen_width;
+                g_epdc_parms[0].rect[3] = screen_height;
+                g_epdc_parms[0].waveform_mode = 2; // GC16 full refresh
+                g_epdc_parms[0].update_mode = 0;
+                g_epdc_parms[0].update_marker = ++g_update_marker;
+                g_epdc_parms[0].flag = 0x21000;
+
+                drmModeAtomicAddProperty(req, g_plane_id, prop_epdc_parms_addr, (uint64_t)(uintptr_t)&g_epdc_parms[0]);
+                drmModeAtomicAddProperty(req, g_plane_id, prop_epdc_cnt, 1);
+            }
+
+            int ret = drmModeAtomicCommit(drm_fd, req, DRM_MODE_ATOMIC_ALLOW_MODESET, NULL);
+            if (ret) {
+                printf("minui: initial atomic commit returned %d, attempting legacy drmModeSetCrtc fallback\n", ret);
+                drm_enable_crtc(drm_fd, main_monitor_crtc, drm_surfaces[1]);
+            } else {
+                printf("minui: initial atomic commit with EPDC refresh successful!\n");
+            }
+            drmModeAtomicFree(req);
+        }
+    } else {
+        drm_enable_crtc(drm_fd, main_monitor_crtc, drm_surfaces[1]);
     }
 
     return draw_buf;
 }
 
 static GRSurface* drm_flip(minui_backend* backend __unused) {
-    int ret;
     memcpy(drm_surfaces[current_buffer]->base.data,
-            draw_buf->data, draw_buf->height * draw_buf->row_bytes);
+           draw_buf->data,
+           draw_buf->height * draw_buf->row_bytes);
 
-    ret = drmModePageFlip(drm_fd, main_monitor_crtc->crtc_id,
-                          drm_surfaces[current_buffer]->fb_id, 0, NULL);
-    if (ret < 0) {
-        // Fallback to drmModeSetCrtc for Qualcomm SDE command-mode/EPDC displays
-        drmModeSetCrtc(drm_fd, main_monitor_crtc->crtc_id,
-                       drm_surfaces[current_buffer]->fb_id,
-                       0, 0,
-                       &main_monitor_connector->connector_id,
-                       1,
-                       &main_monitor_crtc->mode);
+    bool commit_ok = false;
+
+    if (g_has_atomic) {
+        drmModeAtomicReq *req = drmModeAtomicAlloc();
+        if (req) {
+            drmModeAtomicAddProperty(req, g_plane_id, prop_plane_fb_id, drm_surfaces[current_buffer]->fb_id);
+            drmModeAtomicAddProperty(req, g_plane_id, prop_plane_crtc_id, main_monitor_crtc->crtc_id);
+            if (prop_plane_src_w) drmModeAtomicAddProperty(req, g_plane_id, prop_plane_src_w, ((uint64_t)screen_width) << 16);
+            if (prop_plane_src_h) drmModeAtomicAddProperty(req, g_plane_id, prop_plane_src_h, ((uint64_t)screen_height) << 16);
+            if (prop_plane_crtc_w) drmModeAtomicAddProperty(req, g_plane_id, prop_plane_crtc_w, screen_width);
+            if (prop_plane_crtc_h) drmModeAtomicAddProperty(req, g_plane_id, prop_plane_crtc_h, screen_height);
+
+            /* Inject Qualcomm EPDC update waveform parameters */
+            if (prop_epdc_parms_addr && prop_epdc_cnt) {
+                memset(g_epdc_parms, 0, sizeof(g_epdc_parms));
+                g_epdc_parms[0].rect[0] = 0;
+                g_epdc_parms[0].rect[1] = 0;
+                g_epdc_parms[0].rect[2] = screen_width;
+                g_epdc_parms[0].rect[3] = screen_height;
+                g_epdc_parms[0].waveform_mode = 2; // GC16
+                g_epdc_parms[0].update_mode = 0;
+                g_epdc_parms[0].update_marker = ++g_update_marker;
+                g_epdc_parms[0].flag = 0x21000;
+
+                drmModeAtomicAddProperty(req, g_plane_id, prop_epdc_parms_addr, (uint64_t)(uintptr_t)&g_epdc_parms[0]);
+                drmModeAtomicAddProperty(req, g_plane_id, prop_epdc_cnt, 1);
+            }
+
+            int ret = drmModeAtomicCommit(drm_fd, req, 0, NULL);
+            if (ret != 0) {
+                /* Retry with ALLOW_MODESET if non-modeset atomic flip rejected */
+                ret = drmModeAtomicCommit(drm_fd, req, DRM_MODE_ATOMIC_ALLOW_MODESET, NULL);
+            }
+
+            if (ret == 0) {
+                commit_ok = true;
+            } else {
+                printf("minui: drmModeAtomicCommit flip returned error %d\n", ret);
+            }
+
+            drmModeAtomicFree(req);
+        }
     }
 
-    // Trigger physical E-Ink panel refresh via sysfs node
-    int epdc_fd = open("/sys/devices/platform/onyx_epdc_fb.0/update_snapshot", O_WRONLY);
-    if (epdc_fd >= 0) {
-        write(epdc_fd, "1\n", 2);
-        close(epdc_fd);
+    if (!commit_ok) {
+        int ret = drmModePageFlip(drm_fd,
+                                  main_monitor_crtc->crtc_id,
+                                  drm_surfaces[current_buffer]->fb_id,
+                                  0,
+                                  NULL);
+        if (ret < 0) {
+            drmModeSetCrtc(drm_fd, main_monitor_crtc->crtc_id,
+                           drm_surfaces[current_buffer]->fb_id,
+                           0, 0,
+                           &main_monitor_connector->connector_id,
+                           1,
+                           &main_monitor_crtc->mode);
+        }
     }
 
     current_buffer = 1 - current_buffer;
     return draw_buf;
 }
 
+static void drm_blank(minui_backend* backend __unused, bool blank) {
+    if (blank) {
+        if (g_has_atomic && prop_crtc_active) {
+            drmModeAtomicReq *req = drmModeAtomicAlloc();
+            if (req) {
+                drmModeAtomicAddProperty(req, main_monitor_crtc->crtc_id, prop_crtc_active, 0);
+                drmModeAtomicCommit(drm_fd, req, DRM_MODE_ATOMIC_ALLOW_MODESET, NULL);
+                drmModeAtomicFree(req);
+            }
+        } else {
+            drm_disable_crtc(drm_fd, main_monitor_crtc);
+        }
+    } else {
+        drm_flip(backend);
+    }
+}
+
 static void drm_exit(minui_backend* backend __unused) {
-    drm_disable_crtc(drm_fd, main_monitor_crtc);
+    drm_blank(backend, true);
     drm_destroy_surface(drm_surfaces[0]);
     drm_destroy_surface(drm_surfaces[1]);
-    drmModeFreeCrtc(main_monitor_crtc);
-    drmModeFreeConnector(main_monitor_connector);
-    close(drm_fd);
-    drm_fd = -1;
+    if (g_mode_blob_id) {
+        drmModeDestroyPropertyBlob(drm_fd, g_mode_blob_id);
+        g_mode_blob_id = 0;
+    }
+    if (main_monitor_crtc) {
+        drmModeFreeCrtc(main_monitor_crtc);
+        main_monitor_crtc = NULL;
+    }
+    if (main_monitor_connector) {
+        drmModeFreeConnector(main_monitor_connector);
+        main_monitor_connector = NULL;
+    }
+    if (drm_fd >= 0) {
+        close(drm_fd);
+        drm_fd = -1;
+    }
 }
 
 static minui_backend drm_backend = {

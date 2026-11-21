@@ -1,23 +1,21 @@
-# TWRP Device Tree for Onyx Boox C69 (`C69_M_STAR`)
+# TWRP Device Tree for Onyx Boox C69HD (`C69_M_STAR`)
 
-An open-source TeamWin Recovery Project (TWRP 11.0) device tree for the unbranded **Onyx Boox C69** platform (commercial twin: **Onyx Boox Faust 5** / classic Onyx C-Series 6.0" chassis).
+An open-source TeamWin Recovery Project (TWRP 11.0) device tree for the **Onyx Boox C69HD** (`C69_M_STAR`, Qualcomm SM6225 / Scuba IoT).
 
-[![Build TWRP Recovery](https://github.com/7sarus/android_device_onyx_c69/actions/workflows/twrp.yml/badge.svg)](https://github.com/7sarus/android_device_onyx_c69/actions/workflows/twrp.yml)
+Forked and enhanced from [@7sarus/android_device_onyx_c69](https://github.com/7sarus/android_device_onyx_c69) with **native Qualcomm Atomic DRM EPDC E-Ink display drivers** and **full touchscreen support**.
+
+[![Build TWRP Recovery](https://github.com/Zeusx212/android_device_onyx_c69/actions/workflows/twrp.yml/badge.svg)](https://github.com/Zeusx212/android_device_onyx_c69/actions/workflows/twrp.yml)
 
 > [!IMPORTANT]
 > **Zero-Risk Testing via Unlocked Bootloader**:
-> The bootloader on this device is **unlocked** (`unlocked:yes`, `critical unlocked: true`). Never flash custom recovery to internal storage directly. Always test custom builds in memory:
+> The bootloader on this device is **unlocked** (`unlocked:yes`, `critical unlocked: true`). Never flash custom recovery to internal storage directly. Always test custom builds in memory first:
 > ```bash
 > fastboot boot recovery.img
 > ```
 
 > [!NOTE]
-> **Pure Ambient Display (Zero LEDs)**:
-> This specific white-label hardware variant completely omits both the frontlight LED guide layer and status LEDs. The E-Ink Carta panel relies entirely on ambient reflective light, providing higher contrast and cleaner white levels than frontlit screens.
-
-> [!WARNING]
-> **No Warranty**:
-> This device tree and compiled builds come with **absolutely no warranty**. Use entirely at your own risk. You are welcome to test, submit pull requests, and report issues/logs on [GitHub Issues](https://github.com/7sarus/android_device_onyx_c69/issues).
+> **E-Ink Display & Touch Fix**:
+> This fork solves the upstream issue where TWRP booted but stayed on two black bars / blank screen. On Qualcomm Bengal/Scuba, the EPDC hardware requires atomic DRM plane properties (`EPDC_UPDATE_PARMS_ADDR` and `EPDC_UPDATE_CNT`) to pulse waveforms across the E-Ink panel. The patched graphics backend implements this directly.
 
 ---
 
@@ -28,18 +26,30 @@ An open-source TeamWin Recovery Project (TWRP 11.0) device tree for the unbrande
 | **Build & CI** | Working | Compiles cleanly via GitHub Actions & minimal manifest |
 | **Kernel Boot** | Working | Boots successfully into RAM (`fastboot boot recovery.img`) |
 | **USB / ADB** | Working | Enumerates as recovery device; ADB shell accessible |
-| **E-Ink Display** | Broken | Shows two black bars; DRM / EPDC framebuffer not drawing TWRP GUI |
-| **Touch / UI** | Blocked | Digitizer and UI interaction blocked by display output failure |
+| **E-Ink Display** | **Fixed** | Native Atomic DRM EPDC waveform driver (`EPDC_UPDATE_PARMS_ADDR` + `EPDC_UPDATE_CNT`) |
+| **Touch / UI** | **Working** | FocalTech `fts_ts` multi-touch digitizer (`/dev/input/event4`) |
+| **Physical Keys** | Working | Page Up (`0x68`), Page Down (`0x6d`), Home/Back (`0x8f`), Power (`0x74`) |
 
-### What Works
-- GitHub Actions CI workflow builds without errors.
-- Device boots the recovery image via fastboot tether boot.
-- USB gadget initializes and ADB daemon responds in recovery mode.
+---
 
-### What Doesn't Work / Untested
-- **Display Output**: E-Ink screen only displays two black bars instead of the TWRP touch interface.
-- **UI Interaction**: Touch and key handling cannot be used without display output.
-- **Storage & Decryption**: Partition mounting and `/data` decryption are untested pending screen fix.
+## Technical Deep-Dive: How the E-Ink Screen Fix Works
+
+### The Root Cause of the Upstream "Two Black Bars" Bug
+In typical LCD/OLED recoveries, the DRM dumb buffer scans out continuously to the display at 60 Hz via standard DSI video signals.
+However, E-Ink Carta displays are **bi-stable and passive**:
+- Microcapsule pigments require high-voltage waveform pulses (+15V / -15V from TI TPS6518x PMIC) to change physical state.
+- In Qualcomm's display kernel driver (`__sde_plane_atomic_update_epdc`), commits are rejected with update count 0 unless two vendor atomic properties are provided:
+  1. `EPDC_UPDATE_PARMS_ADDR` — Memory pointer to `struct epdc_update_params` (320 bytes, 8 rect slots).
+  2. `EPDC_UPDATE_CNT` — Valid rectangle count (`1` for full-screen GUI refresh).
+- Without these properties, the kernel loads frames into RAM but **never fires the EPDC waveform engine**, leaving the screen frozen on the bootloader splash.
+
+### The Solution in `patches/graphics_drm.cpp`
+1. **Universal Planes & Atomic DRM Initialization**:
+   Enables `DRM_CLIENT_CAP_UNIVERSAL_PLANES` and `DRM_CLIENT_CAP_ATOMIC`, queries the primary EPDC plane for `EPDC_UPDATE_PARMS_ADDR` and `EPDC_UPDATE_CNT`.
+2. **Atomic EPDC Flip**:
+   Every time TWRP flushes a frame in `drm_flip()`, it populates a 40-byte update struct (`rect: [0, 0, 758, 1024]`, waveform mode: `2` (GC16), `update_marker++`), attaches the atomic properties, and executes `drmModeAtomicCommit()`.
+3. **E-Ink Refresh Tuning**:
+   Disables animated progress bars, CPU temperature polling, and battery percentage polling in `BoardConfig.mk` (`TW_NO_BATTERY_PERCENT`, `TW_NO_CPU_TEMP`) to eliminate screen ghosting.
 
 ---
 
@@ -186,3 +196,10 @@ fastboot boot recovery.img
 fastboot flash recovery_a recovery.img
 fastboot flash recovery_b recovery.img
 ```
+
+---
+
+## Credits & Gratitude
+- **[@7sarus](https://github.com/7sarus)**: Creator of the original device tree, fastboot/EDL partition maps, and initial CI build pipeline ([7sarus/android_device_onyx_c69](https://github.com/7sarus/android_device_onyx_c69)).
+- **TeamWin (TWRP)**: Custom recovery framework and touch UI engine.
+- **spavikevik**: Reverse-engineering notes on Qualcomm SDE EPDC DRM plane parameters ([palma2pro-eos](https://github.com/spavikevik/palma2pro-eos)).
