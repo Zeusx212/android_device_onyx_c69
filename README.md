@@ -33,28 +33,59 @@ Forked and enhanced from [@7sarus/android_device_onyx_c69](https://github.com/7s
 
 ---
 
-## Technical Deep-Dive: Onyx Boox C69HD Display Pipeline & EPDC Solution
+## The Engineering Journey: Discoveries & Struggles
 
-### 1. Dual-Display Hardware Architecture
-The Onyx Boox C69HD runs two concurrent display interfaces in kernel DRM:
-- **Display 0 (Connector 29, CRTC 75)**: Command-mode interface (`1024x758 @ 40Hz`). Uses **Plane 68** (`SSPP ViG0`). This is where userspace (TWRP GUI and Android SurfaceFlinger) renders framebuffers and queues EPDC waveform updates.
-- **Display 1 (Connector 46, CRTC 112)**: Hardware Video-mode interface (`301x769 @ 90Hz`, DSI-2). Uses **Plane 65** (`SSPP DMA0`). This is the hardware timing controller link to the E-Ink EPDC TCON (`qcom,mdss_dsi_epdc_cmd`).
+Developing a working custom recovery for the **Onyx Boox C69HD** required solving intricate kernel DRM and Qualcomm SDE display pipeline challenges unique to E-Ink hardware. Below is the technical chronicle of the failures, investigations, and breakthroughs:
 
-### 2. The SMMU Page Fault & Continuous Splash Trap
-- In Qualcomm SDE KMS, the bootloader leaves continuous splash active in physical RAM at `0x5c000000`, scanning out through Plane 65 on CRTC 112.
-- If userspace commits an atomic request with `DRM_MODE_ATOMIC_ALLOW_MODESET` (`0x100`) or attempts to modify/disable CRTC 112, the kernel DRM driver calls `_sde_kms_release_splash_resource` and unmaps `0x5c000000` from the SMMU.
-- Because Plane 65 continues fetching from `0x5c000000`, this triggers infinite SMMU page faults (`iova=0x5c000000, client name: mdp_0`), choking the MDP bus and freezing the screen permanently on the bootloader logo.
+### 1. The Initial Blank Screen / Two Black Bars Bug
+- **The Symptom**: Upstream TWRP compiled and booted into memory, but the display remained completely blank or stuck with two static black bars.
+- **The Cause**: Standard Android recoveries use dumb framebuffers that scan out continuously at 60 Hz over standard DSI video signals. E-Ink Carta displays are bi-stable and require high-voltage waveform pulses (+15V / -15V from the Texas Instruments TPS6518x PMIC) driven by the EPDC controller to move physical microcapsules.
+- **The Finding**: The Qualcomm vendor driver (`__sde_plane_atomic_update_epdc`) silently drops all commits with update count 0 unless two vendor atomic DRM properties are attached:
+  1. `EPDC_UPDATE_PARMS_ADDR` — Memory pointer to `struct epdc_update_params` (320 bytes, 8 rect slots).
+  2. `EPDC_UPDATE_CNT` — Valid rectangle count (`1` for full GUI refresh).
 
-### 3. The Solution in `patches/graphics_drm.cpp`
-By reverse-engineering the stock recovery binary (`librecovery_ui.so`), we matched the exact vendor pipeline mechanics:
-1. **Leave CRTC 112 / DSI-2 Untouched**:
-   Userspace never touches CRTC 112 or Connector 46, matching stock Android SurfaceFlinger.
-2. **Bind to Primary Graphics Plane 68**:
-   Enumerate planes from `drmModeGetPlaneResources()`, skip plane index 0 (Plane 65 / continuous splash), and bind to plane index 1 (**Plane 68**). Plane 49 is an internal kernel plane reserved for waveform dispatch.
-3. **Commit with `DRM_MODE_ATOMIC_NONBLOCK` (`0x400`)**:
-   Both initial pipeline modeset and subsequent flips commit with `DRM_MODE_ATOMIC_NONBLOCK`. This never triggers `_sde_kms_release_splash_resource`, keeping `0x5c000000` mapped and eliminating 100% of SMMU faults.
-4. **Qualcomm EPDC Waveform Parameters**:
-   Every frame attaches `EPDC_UPDATE_PARMS_ADDR` and `EPDC_UPDATE_CNT` on Plane 68, queuing full GC16 waveform updates to the physical panel.
+### 2. The "Star Education" Logo Lockup & SMMU Page Fault Storm (Run 7)
+- **The Symptom**: After adding atomic EPDC flips, the TWRP log reported `first atomic EPDC flip committed successfully (ret=0)`, yet the physical screen remained frozen on the bootloader splash ("Star Education" logo).
+- **The Investigation**: Inspecting kernel `dmesg` uncovered an infinite barrage of ARM SMMU page faults choking the memory bus:
+  ```
+  [drm:msm_smmu_fault_handler] *ERROR* trigger dump, iova=0x5c000000, flags=0x25
+  arm-smmu c600000.apps-smmu: Unhandled context fault: iova=0x5c000000, cb=2, fsr=0x40000402
+  ```
+- **The Cause**: Physical address `0x5c000000` is the continuous splash framebuffer allocated in RAM by the bootloader. We initially attempted to disable continuous splash via `disable_non_main_crtcs` by setting `ACTIVE=0` on CRTC 112. The DRM atomic check rejected this with `-22 (EINVAL)` because associated planes were still active. Crucially, the kernel's `_sde_kms_release_splash_resource` still unmapped `0x5c000000` from the SMMU while Plane 65 kept fetching from it, locking up the entire Mobile Display Processor (MDP).
+
+### 3. The 900E Diagnostics Crash & Sahara Protocol Rescue (Run 8)
+- **The Symptom**: In Run 8, we attempted to cleanly detach CRTC 112, Connector 46, and Plane 65 in the initial atomic modeset request. This violated kernel atomic pipe topology constraints (`sde_crtc_prepare_commit_epdc`), causing a kernel panic on boot.
+- **The Panic**: The Onyx Boox C69HD crashed directly into Qualcomm Emergency Diagnostics 900E mode (`USB\VID_05C6&PID_900E` on `COM4`), unresponsive to ADB and fastboot.
+- **The Rescue**: We engineered a custom Python Sahara protocol packet injector using the Windows Win32 API, transmitted a raw Sahara Reset command (`\x07\x00\x00\x00\x08\x00\x00\x00`) over `COM4`, received acknowledgment `0800000008000000` (`SAHARA_RESET_RSP`), and successfully revived the SoC into normal Android.
+
+### 4. The Reverse-Engineering Breakthrough (Decompiling Stock `librecovery_ui.so`)
+To uncover how the manufacturer handled the hardware without crashing, we extracted and disassembled the stock recovery binary (`librecovery_ui.so`) using Capstone:
+
+```
+0x358f0: DisableNonMainCrtcs -> cmp other_crtc, main_crtc; b.ne 0x35a10 (EXITS IMMEDIATELY!)
+0x36a50: cbz x23, 0x36a44    -> EXPLICITLY SKIPS PLANE INDEX 0 (Plane 65 / Splash)!
+0x36a5c: planes[1]           -> BINDS TO PLANE 68 (SSPP ViG0)!
+0x356d0: mov w2, #0x400      -> COMMITS WITH DRM_MODE_ATOMIC_NONBLOCK!
+```
+
+Key architectural revelations:
+1. **Dual Display Hardware Architecture**:
+   - **Display 0 (Connector 29, CRTC 75)**: Primary Command-mode interface (`1024x758 @ 40Hz`). Uses **Plane 68** (`SSPP ViG0`). This is where userspace renders framebuffers and queues EPDC waveform updates.
+   - **Display 1 (Connector 46, CRTC 112)**: Hardware Video-mode interface (`301x769 @ 90Hz`, DSI-2). Uses **Plane 65** (`SSPP DMA0`). This is the hardware timing controller link to the E-Ink EPDC TCON (`qcom,mdss_dsi_epdc_cmd`).
+2. **The Plane Hierarchy**:
+   - `Plane 49`: An **internal kernel plane** reserved exclusively for the `onyx_epdc_fb` driver to push waveform LUT packets. When userspace hijacked Plane 49, it created pipeline split conflicts (`invalid src split cfg, stage:0 left:65 right:49`).
+   - `Plane 65 (index 0)`: Bootloader continuous splash plane (`SSPP DMA0`). Stock recovery explicitly skips it.
+   - `Plane 68 (index 1)`: The true primary userspace scanout plane (`SSPP ViG0`) that carries `EPDC_UPDATE_CNT` and `EPDC_UPDATE_PARMS_ADDR`.
+3. **The Atomic Commit Flag**:
+   - Stock recovery **never** commits with `DRM_MODE_ATOMIC_ALLOW_MODESET` (`0x100`). Using `ALLOW_MODESET` triggers `_sde_kms_release_splash_resource` in the kernel, unmapping `0x5c000000`.
+   - Stock recovery commits exclusively with **`DRM_MODE_ATOMIC_NONBLOCK` (`0x400`)**, leaving continuous splash memory mapped and preventing all SMMU page faults.
+
+### 5. The Final Solution (Run 10)
+Implementing these discoveries in `patches/graphics_drm.cpp`:
+- Enumerate planes from `drmModeGetPlaneResources()`, skip plane index 0, and bind to **Plane 68**.
+- Never touch CRTC 112, Connector 46, or Plane 65 in userspace.
+- Commit initial modeset and flips using `DRM_MODE_ATOMIC_NONBLOCK` (`0x400`).
+- **Result**: Zero SMMU page faults, 879+ EPDC frames rendered with 0 errors, and full touchscreen navigation across all TWRP menus on physical hardware!
 
 ---
 
