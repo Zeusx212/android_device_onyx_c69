@@ -1,6 +1,6 @@
 # TWRP Device Tree for Onyx Boox C69HD (`C69_M_STAR`)
 
-An open-source TeamWin Recovery Project (TWRP 11.0) device tree for the **Onyx Boox C69HD** (`C69_M_STAR`, Qualcomm SM6225 / Scuba IoT).
+An open-source TeamWin Recovery Project (TWRP 11.0) device tree for the **Onyx Boox C69HD** (`C69_M_STAR`, Qualcomm SM6225 / Bengal).
 
 Forked and enhanced from [@7sarus/android_device_onyx_c69](https://github.com/7sarus/android_device_onyx_c69) with **native Qualcomm Atomic DRM EPDC E-Ink display drivers** and **full touchscreen support**.
 
@@ -8,14 +8,15 @@ Forked and enhanced from [@7sarus/android_device_onyx_c69](https://github.com/7s
 
 > [!IMPORTANT]
 > **Zero-Risk Testing via Unlocked Bootloader**:
-> The bootloader on this device is **unlocked** (`unlocked:yes`, `critical unlocked: true`). Never flash custom recovery to internal storage directly. Always test custom builds in memory first:
+> The bootloader on the Onyx Boox C69HD is **unlocked** (`unlocked:yes`, `critical unlocked: true`).
+> **NEVER flash custom recovery to internal storage directly.** Always tether-boot builds safely in RAM:
 > ```bash
 > fastboot boot recovery.img
 > ```
 
 > [!NOTE]
-> **E-Ink Display & Touch Fix**:
-> This fork solves the upstream issue where TWRP booted but stayed on two black bars / blank screen. On Qualcomm Bengal/Scuba, the EPDC hardware requires atomic DRM plane properties (`EPDC_UPDATE_PARMS_ADDR` and `EPDC_UPDATE_CNT`) to pulse waveforms across the E-Ink panel. The patched graphics backend implements this directly.
+> **E-Ink Display & Touch Support**:
+> This fork solves the display frozen / blank screen issue on the Onyx Boox C69HD. On Qualcomm Bengal/Scuba, the EPDC hardware requires vendor atomic DRM plane properties (`EPDC_UPDATE_PARMS_ADDR` and `EPDC_UPDATE_CNT`) and specific plane binding (`Plane 68` / `SSPP ViG0`) committed with `DRM_MODE_ATOMIC_NONBLOCK` to pulse waveforms across the E-Ink panel without triggering continuous splash SMMU page faults.
 
 ---
 
@@ -25,31 +26,35 @@ Forked and enhanced from [@7sarus/android_device_onyx_c69](https://github.com/7s
 | :--- | :--- | :--- |
 | **Build & CI** | Working | Compiles cleanly via GitHub Actions & minimal manifest |
 | **Kernel Boot** | Working | Boots successfully into RAM (`fastboot boot recovery.img`) |
-| **USB / ADB** | Working | Enumerates as recovery device; ADB shell accessible |
-| **E-Ink Display** | **Fixed** | Native Atomic DRM EPDC waveform driver (`EPDC_UPDATE_PARMS_ADDR` + `EPDC_UPDATE_CNT`) |
-| **Touch / UI** | **Working** | FocalTech `fts_ts` multi-touch digitizer (`/dev/input/event4`) |
+| **USB / ADB** | Working | Enumerates as recovery device; root ADB shell fully functional |
+| **E-Ink Display** | **Verified Working** | Native Atomic DRM EPDC driver on Plane 68 (`EPDC_UPDATE_PARMS_ADDR` + `EPDC_UPDATE_CNT`) |
+| **Touchscreen** | **Verified Working** | FocalTech `fts_ts` multi-touch digitizer (`/dev/input/event4`), full GUI navigation |
 | **Physical Keys** | Working | Page Up (`0x68`), Page Down (`0x6d`), Home/Back (`0x8f`), Power (`0x74`) |
 
 ---
 
-## Technical Deep-Dive: How the E-Ink Screen Fix Works
+## Technical Deep-Dive: Onyx Boox C69HD Display Pipeline & EPDC Solution
 
-### The Root Cause of the Upstream "Two Black Bars" Bug
-In typical LCD/OLED recoveries, the DRM dumb buffer scans out continuously to the display at 60 Hz via standard DSI video signals.
-However, E-Ink Carta displays are **bi-stable and passive**:
-- Microcapsule pigments require high-voltage waveform pulses (+15V / -15V from TI TPS6518x PMIC) to change physical state.
-- In Qualcomm's display kernel driver (`__sde_plane_atomic_update_epdc`), commits are rejected with update count 0 unless two vendor atomic properties are provided:
-  1. `EPDC_UPDATE_PARMS_ADDR` — Memory pointer to `struct epdc_update_params` (320 bytes, 8 rect slots).
-  2. `EPDC_UPDATE_CNT` — Valid rectangle count (`1` for full-screen GUI refresh).
-- Without these properties, the kernel loads frames into RAM but **never fires the EPDC waveform engine**, leaving the screen frozen on the bootloader splash.
+### 1. Dual-Display Hardware Architecture
+The Onyx Boox C69HD runs two concurrent display interfaces in kernel DRM:
+- **Display 0 (Connector 29, CRTC 75)**: Command-mode interface (`1024x758 @ 40Hz`). Uses **Plane 68** (`SSPP ViG0`). This is where userspace (TWRP GUI and Android SurfaceFlinger) renders framebuffers and queues EPDC waveform updates.
+- **Display 1 (Connector 46, CRTC 112)**: Hardware Video-mode interface (`301x769 @ 90Hz`, DSI-2). Uses **Plane 65** (`SSPP DMA0`). This is the hardware timing controller link to the E-Ink EPDC TCON (`qcom,mdss_dsi_epdc_cmd`).
 
-### The Solution in `patches/graphics_drm.cpp`
-1. **Universal Planes & Atomic DRM Initialization**:
-   Enables `DRM_CLIENT_CAP_UNIVERSAL_PLANES` and `DRM_CLIENT_CAP_ATOMIC`, queries the primary EPDC plane for `EPDC_UPDATE_PARMS_ADDR` and `EPDC_UPDATE_CNT`.
-2. **Atomic EPDC Flip**:
-   Every time TWRP flushes a frame in `drm_flip()`, it populates a 40-byte update struct (`rect: [0, 0, 758, 1024]`, waveform mode: `2` (GC16), `update_marker++`), attaches the atomic properties, and executes `drmModeAtomicCommit()`.
-3. **E-Ink Refresh Tuning**:
-   Disables animated progress bars, CPU temperature polling, and battery percentage polling in `BoardConfig.mk` (`TW_NO_BATTERY_PERCENT`, `TW_NO_CPU_TEMP`) to eliminate screen ghosting.
+### 2. The SMMU Page Fault & Continuous Splash Trap
+- In Qualcomm SDE KMS, the bootloader leaves continuous splash active in physical RAM at `0x5c000000`, scanning out through Plane 65 on CRTC 112.
+- If userspace commits an atomic request with `DRM_MODE_ATOMIC_ALLOW_MODESET` (`0x100`) or attempts to modify/disable CRTC 112, the kernel DRM driver calls `_sde_kms_release_splash_resource` and unmaps `0x5c000000` from the SMMU.
+- Because Plane 65 continues fetching from `0x5c000000`, this triggers infinite SMMU page faults (`iova=0x5c000000, client name: mdp_0`), choking the MDP bus and freezing the screen permanently on the bootloader logo.
+
+### 3. The Solution in `patches/graphics_drm.cpp`
+By reverse-engineering the stock recovery binary (`librecovery_ui.so`), we matched the exact vendor pipeline mechanics:
+1. **Leave CRTC 112 / DSI-2 Untouched**:
+   Userspace never touches CRTC 112 or Connector 46, matching stock Android SurfaceFlinger.
+2. **Bind to Primary Graphics Plane 68**:
+   Enumerate planes from `drmModeGetPlaneResources()`, skip plane index 0 (Plane 65 / continuous splash), and bind to plane index 1 (**Plane 68**). Plane 49 is an internal kernel plane reserved for waveform dispatch.
+3. **Commit with `DRM_MODE_ATOMIC_NONBLOCK` (`0x400`)**:
+   Both initial pipeline modeset and subsequent flips commit with `DRM_MODE_ATOMIC_NONBLOCK`. This never triggers `_sde_kms_release_splash_resource`, keeping `0x5c000000` mapped and eliminating 100% of SMMU faults.
+4. **Qualcomm EPDC Waveform Parameters**:
+   Every frame attaches `EPDC_UPDATE_PARMS_ADDR` and `EPDC_UPDATE_CNT` on Plane 68, queuing full GC16 waveform updates to the physical panel.
 
 ---
 
@@ -99,9 +104,8 @@ graph TD
 
 | Component | Specification | Live Verified Source |
 | :--- | :--- | :--- |
-| **Model / ODM** | `C69_M_STAR` | `ro.product.model = C69_M_STAR` |
-| **Commercial Twin** | Onyx Boox Faust 5 | Same chassis, buttons, SoC, and resolution |
-| **SoC Platform** | Qualcomm Scuba IoT (`SCUBAPIIOT`) | Platform `bengal`, variant `QCS EMMC` (`001860e1`) |
+| **Model** | Onyx Boox C69HD (`C69_M_STAR`) | `ro.product.model = C69_M_STAR` |
+| **SoC Platform** | Qualcomm SM6225 Bengal / Scuba IoT | Platform `bengal`, variant `QCS EMMC` (`001860e1`) |
 | **CPU Architecture** | 4× ARM Cortex-A53 @ 2.0 GHz | 64-bit kernel, `arm64-v8a` ABI (Part `0x801`) |
 | **RAM** | 2 GB LPDDR4X | `MemTotal: 1817196 kB` |
 | **Internal Storage** | 16 GB eMMC | `/dev/block/mmcblk0` (`MMC16G`, Micron/Spectek) |
@@ -109,7 +113,7 @@ graph TD
 | **Display Panel** | 6.0" E-Ink Carta | 758 × 1024 pixels (212 PPI, 4:3 aspect ratio) |
 | **E-Ink Display PMIC** | Texas Instruments **TPS6518x** | I2C1 @ `0x68` (VPOS +15V, VNEG -15V, VEE -20V, VDD +22V) |
 | **Audio Amplifier** | Qualcomm **WSA881x** | Smart speaker amplifier (`wsa881x-i2c-codec`) |
-| **Touchscreen Digitizer** | FocalTech `fts_ts` | 1448 × 1072 digitized surface grid |
+| **Touchscreen Digitizer** | FocalTech `fts_ts` | 1448 × 1072 digitized surface grid (`/dev/input/event4`) |
 | **Front Light / LEDs** | **None** | Completely unpopulated (pure ambient reflective) |
 | **Kernel Version** | Linux `4.19.157-perf` | Stock prebuilt kernel included in tree |
 
@@ -123,7 +127,7 @@ flowchart LR
     Event3 -->|0x006d| K_NEXT["KEY_PAGEDOWN (Next Page)"]
     Event1["/dev/input/event1 (onyx-misc)"] -->|0x008f| K_HOME["KEY_HOMEPAGE / KEY_BACK"]
     Event0["/dev/input/event0 (qpnp_pon)"] -->|0x0074| K_PWR["KEY_POWER"]
-    Event2["/dev/input/event2 (onyx-hall)"] -->|0x008f / 0x0074| K_LID["Cover Close / Open (Sleep)"]
+    Event2["/dev/input/event2 (onyx-hall)"] -->|0x0038 / 0x008f| K_LID["Cover Close / Open (Sleep)"]
 ```
 
 | Event Node | Driver Name | Linux Keycode | Action / TWRP Function |
@@ -183,23 +187,18 @@ mka recoveryimage -j$(nproc --all)
 
 ---
 
-## Testing & Installation
+## Testing & Usage Instructions
 
-### Step 1: Tether-boot in RAM (Zero Risk)
+### Tether-boot in RAM (Recommended & Zero Risk)
 ```bash
 adb reboot bootloader
 fastboot boot recovery.img
 ```
-
-### Step 2: Flash Permanently (Only after verified working)
-```bash
-fastboot flash recovery_a recovery.img
-fastboot flash recovery_b recovery.img
-```
+*Note: The recovery executes entirely in RAM without modifying your internal recovery or boot partitions.*
 
 ---
 
-## Credits & Gratitude
-- **[@7sarus](https://github.com/7sarus)**: Creator of the original device tree, fastboot/EDL partition maps, and initial CI build pipeline ([7sarus/android_device_onyx_c69](https://github.com/7sarus/android_device_onyx_c69)).
+## Credits & Upstream Attribution
+- **[@7sarus](https://github.com/7sarus)**: Creator of the original device tree, fastboot/EDL partition maps, and initial CI build pipeline ([7sarus/android_device_onyx_c69](https://github.com/7sarus/android_device_onyx_c69)). Sincere gratitude for establishing the foundational device tree and build manifest.
 - **TeamWin (TWRP)**: Custom recovery framework and touch UI engine.
 - **spavikevik**: Reverse-engineering notes on Qualcomm SDE EPDC DRM plane parameters ([palma2pro-eos](https://github.com/spavikevik/palma2pro-eos)).
